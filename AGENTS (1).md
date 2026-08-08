@@ -1,53 +1,51 @@
-# MCP Hosting Helpers (`agent-framework-hosting-mcp`)
+# Mistral Package (agent-framework-mistral)
 
-Side-effect-free adapters and conversion helpers for hosting Agent Framework
-agents and workflows through the native MCP SDK.
+Integration with Mistral AI for chat completions and embedding generation.
 
-## Public API
+## Implementation Notes
 
-- `AgentMCPTool(target, ...)` generates one native MCP `Tool` from an agent,
-  converts and executes calls, and optionally persists sessions through an
-  existing `AgentState`.
-- `WorkflowMCPTool(target, ...)` derives one native MCP `Tool` from a workflow's
-  single start-executor input type and converts completed workflow outputs.
-- `mcp_to_run(arguments, *, argument_name="task",
-  chat_option_arguments=())` converts MCP tool arguments to `AgentRunArgs` and
-  copies only explicitly selected arguments into chat options.
-- `mcp_from_run(result)` converts an Agent Framework response or message to MCP
-  `ContentBlock` values.
+- Talks to the Mistral REST API directly over `httpx`; the official `mistralai` SDK is not used
+  because its pinned OpenTelemetry requirements conflict with the rest of the framework.
 
-## Boundary
+## Main Classes
 
-This package does not provide a server, routes, transport lifecycle,
-authentication, authorization, session-key policy, concurrency policy, or
-outbound delivery. Applications compose the adapter and conversion helpers
-with native MCP SDK constructs.
+- **`MistralChatClient`** - Chat client for Mistral AI models with function invocation, middleware, and telemetry
+- **`RawMistralChatClient`** - Chat client without the batteries-included layers
+- **`MistralChatOptions`** - Options TypedDict for Mistral-specific chat parameters
+- **`MistralSettings`** - TypedDict settings for Mistral chat configuration
+- **`MistralEmbeddingClient`** - Embedding client for Mistral AI models
+- **`MistralEmbeddingOptions`** - Options TypedDict for Mistral-specific embedding parameters
+- **`MistralEmbeddingSettings`** - TypedDict settings for Mistral configuration
 
-`AgentMCPTool` owns only the schema for its single generated agent tool. It
-does not register that schema with a server. Applications call
-`await adapter.list_tools()` and `await adapter.call_tool(...)` from native MCP
-handlers.
+## Usage
 
-`WorkflowMCPTool` owns only the schema derived from the start executor. It
-requires exactly one input type. Workflow factories and continuation policy
-remain application-owned. Pending external-input requests raise because the
-adapter does not own a human-in-the-loop continuation contract.
+```python
+from agent_framework import Agent
+from agent_framework.mistral import MistralChatClient
 
-When configured with `AgentState`, the adapter performs session get/run/set.
-Applications still derive and authorize the session identifier and serialize
-concurrent calls for the same session.
+# Requires MISTRAL_API_KEY environment variable (or pass api_key= directly)
+client = MistralChatClient(model="mistral-large-latest")
+try:
+    agent = Agent(client=client)
+    result = await agent.run("Hello!")
+finally:
+    await client.close()
+```
 
-MCP tool arguments are JSON-only and have no native multimodal content-block
-union. Do not add a package-owned JSON convention for image or audio input.
+```python
+from agent_framework.mistral import MistralEmbeddingClient
 
-`mcp_from_run(...)` intentionally returns a flat content block list. It
-preserves content-level metadata, while applications own MCP result-level
-metadata and structured content.
+# Requires MISTRAL_API_KEY environment variable (or pass api_key= directly)
+client = MistralEmbeddingClient(model="mistral-embed")
+try:
+    result = await client.get_embeddings(["Hello, world!"])
+    print(result[0].vector)
+finally:
+    await client.close()
+```
 
-The helper targets `CallToolResult.content`. Do not add sampling-only
-`ToolUseContent` to its output; MCP sampling has a separate response content
-union.
+## Import Path
 
-`CallToolResult` is a single final result. Streamable HTTP transports MCP
-messages rather than partial result content; progress notifications and
-experimental tasks remain application-owned protocol concerns.
+```python
+from agent_framework.mistral import MistralChatClient, MistralEmbeddingClient
+```

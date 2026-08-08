@@ -4,6 +4,6 @@ from enum import IntEnum
 
 
 class FeatureIndex(IntEnum):
-    """Monty-owned feature-usage indexes."""
+    """Mistral-owned feature-usage indexes."""
 
-    MONTY = 80
+    MISTRAL = 60

@@ -1,22 +1,41 @@
-# Lab Package (agent-framework-lab)
+# Mem0 Package (agent-framework-mem0)
 
-Experimental packages for cutting-edge features including benchmarking, reinforcement learning, and research initiatives.
+Integration with Mem0 for agent memory management.
 
-## Structure
+## Main Classes
 
-This package contains experimental sub-packages:
+- **`Mem0ContextProvider`** - Context provider that integrates Mem0 memory into agents
 
-- `gaia/` - GAIA benchmark integration
-- `lightning/` - Lightning-based training utilities
-- `tau2/` - Tau-bench evaluation framework
-- `namespace/` - Experimental namespace utilities
+## Usage
 
-## Note
+```python
+from agent_framework.mem0 import Mem0ContextProvider
 
-Lab packages are experimental and may change frequently. They are not included in the standard `agent-framework[all]` installation.
-
-## Installation
-
-```bash
-pip install agent-framework-lab
+provider = Mem0ContextProvider(
+    api_key="your-key",
+    # Storage scope: memories are written with this user_id.
+    user_id="user-id",
+    # Retrieval scope: must be set explicitly, it never inherits the storage scope.
+    search_user_id="user-id",
+)
 ```
+
+## Memory Scoping
+
+- `application_id` / `agent_id` / `user_id` are the **storage scope** stamped on written memories.
+- `search_application_id` / `search_agent_id` / `search_user_id` are the **retrieval scope**.
+- Retrieval scope never defaults to the storage scope. With no `search_*` value set, `before_run`
+  retrieves nothing and logs a warning. This prevents memories written under a shared `agent_id`
+  from being retrieved for every user of that agent.
+
+## Import Path
+
+```python
+from agent_framework.mem0 import Mem0ContextProvider
+# or directly:
+from agent_framework_mem0 import Mem0ContextProvider
+```
+
+## Notes
+
+Mem0 telemetry is disabled by default. Set `MEM0_TELEMETRY=true` to enable.

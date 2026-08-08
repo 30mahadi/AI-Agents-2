@@ -1,6 +1,6 @@
 [project]
-name = "agent-framework-mistral"
-description = "Mistral AI integration for Microsoft Agent Framework."
+name = "agent-framework-ollama"
+description = "Ollama integration for Microsoft Agent Framework."
 authors = [{ name = "Microsoft", email = "af-support@microsoft.com"}]
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,9 +24,7 @@ classifiers = [
 ]
 dependencies = [
     "agent-framework-core>=1.13.0,<2",
-    # Talks to the Mistral REST API directly; the mistralai SDK is not used because its
-    # pinned OpenTelemetry requirements conflict with the rest of the framework.
-    "httpx>=0.23.1,<1",
+    "ollama>=0.5.3,<0.5.4",
 ]
 
 [tool.uv]
@@ -64,7 +62,7 @@ omit = [
 
 [tool.pyright]
 extends = "../../pyproject.toml"
-include = ["agent_framework_mistral"]
+include = ["agent_framework_ollama"]
 exclude = ['tests']
 
 [tool.mypy]
@@ -83,7 +81,7 @@ disallow_untyped_decorators = true
 disallow_any_unimported = true
 
 [tool.bandit]
-targets = ["agent_framework_mistral"]
+targets = ["agent_framework_ollama"]
 exclude_dirs = ["tests"]
 
 [tool.poe]
@@ -92,14 +90,14 @@ include = "../../shared_tasks.toml"
 
 [tool.poe.tasks.mypy]
 help = "Run MyPy for this package."
-cmd = "mypy --config-file $POE_ROOT/pyproject.toml agent_framework_mistral"
+cmd = "mypy --config-file $POE_ROOT/pyproject.toml agent_framework_ollama"
 
 [tool.poe.tasks.test]
 help = "Run the default unit test suite for this package."
-cmd = 'pytest -m "not integration" --cov=agent_framework_mistral --cov-report=term-missing:skip-covered tests'
+cmd = 'pytest -m "not integration" --cov=agent_framework_ollama --cov-report=term-missing:skip-covered tests'
 
 [tool.uv.build-backend]
-module-name = "agent_framework_mistral"
+module-name = "agent_framework_ollama"
 module-root = ""
 
 [build-system]

@@ -1,22 +1,22 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Agent and workflow MCP tool adapters for app-owned hosting."""
-
 import importlib.metadata
 
-from ._agent_tool import AgentMCPTool
-from ._conversion import mcp_from_run, mcp_to_run
-from ._workflow_tool import WorkflowMCPTool
+from ._chat_client import MistralChatClient, MistralChatOptions, MistralSettings, RawMistralChatClient
+from ._embedding_client import MistralEmbeddingClient, MistralEmbeddingOptions, MistralEmbeddingSettings
 
 try:
     __version__ = importlib.metadata.version(__name__)
 except importlib.metadata.PackageNotFoundError:
-    __version__ = "0.0.0"
+    __version__ = "0.0.0"  # Fallback for development mode
 
 __all__ = [
-    "AgentMCPTool",
-    "WorkflowMCPTool",
+    "MistralChatClient",
+    "MistralChatOptions",
+    "MistralEmbeddingClient",
+    "MistralEmbeddingOptions",
+    "MistralEmbeddingSettings",
+    "MistralSettings",
+    "RawMistralChatClient",
     "__version__",
-    "mcp_from_run",
-    "mcp_to_run",
 ]

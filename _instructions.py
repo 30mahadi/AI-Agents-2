@@ -1,17 +1,19 @@
 # Copyright (c) Microsoft. All rights reserved.
 
+"""Dynamic CodeAct instructions and execute_code tool descriptions for Monty."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
 
 from agent_framework import FunctionTool
 
-from ._types import AllowedDomain
+from ._types import FileMount
 
 
 def _format_tool_summaries(tools: Sequence[FunctionTool]) -> str:
     if not tools:
-        return "- No tools are currently registered inside the sandbox."
+        return "- No tools are currently registered."
 
     lines: list[str] = []
     for tool_obj in tools:
@@ -23,44 +25,29 @@ def _format_tool_summaries(tools: Sequence[FunctionTool]) -> str:
     return "\n".join(lines)
 
 
-def _format_filesystem_capabilities(
-    *,
-    filesystem_enabled: bool,
-    workspace_enabled: bool,
-    mounted_paths: Sequence[str],
-) -> str:
-    if not filesystem_enabled:
-        return "Filesystem access is unavailable because no workspace root or file mounts are configured."
-
-    lines = ["Filesystem access is enabled."]
-    lines.append("Read files from `/input`.")
-    lines.append("Write generated artifacts to `/output`; returned files will be attached to the tool result.")
-
-    if workspace_enabled:
-        lines.append("The configured workspace root is available under `/input/`.")
-
-    if mounted_paths:
-        lines.append("Additional mounted paths:")
-        lines.extend(f"- `{mounted_path}`" for mounted_path in mounted_paths)
-    elif not workspace_enabled:
-        lines.append("No workspace root or explicit file mounts are currently configured.")
-
-    return "\n".join(lines)
-
-
-def _format_network_capabilities(
-    *,
-    allowed_domains: Sequence[AllowedDomain],
-) -> str:
-    if not allowed_domains:
-        return "Outbound network access is unavailable because no allow-listed targets are configured."
-
-    lines = ["Outbound network access is allowed only for these configured targets:"]
-    for allowed_domain in allowed_domains:
-        methods_text = (
-            ", ".join(allowed_domain.methods) if allowed_domain.methods else "all methods allowed by the backend"
+def _format_filesystem_capabilities(mounts: Sequence[FileMount]) -> str:
+    if not mounts:
+        return (
+            "Filesystem access is unavailable. OS-level paths raise `PermissionError`. "
+            "If you need files, ask the agent operator to configure `workspace_root` or `file_mounts`."
         )
-        lines.append(f"- `{allowed_domain.target}`: {methods_text}.")
+
+    lines = ["Filesystem access is enabled. Read and write paths via `pathlib.Path(...)` (or `os.path`)."]
+    lines.append("Configured mounts:")
+    for mount in mounts:
+        cap = ""
+        if mount.write_bytes_limit is not None:
+            cap = f", write cap {mount.write_bytes_limit} bytes"
+        lines.append(f"- `{mount.mount_path}` ({mount.mode}{cap})")
+
+    writable = [mount for mount in mounts if mount.mode == "read-write"]
+    if writable:
+        writable_paths = ", ".join(f"`{m.mount_path}`" for m in writable)
+        lines.append(
+            f"Files written to {writable_paths} are returned to the caller as attached files; "
+            "use these paths for any output artifacts."
+        )
+
     return "\n".join(lines)
 
 
@@ -68,33 +55,41 @@ def build_codeact_instructions(
     *,
     tools: Sequence[FunctionTool],
     tools_visible_to_model: bool,
-    filesystem_enabled: bool = False,
+    mounts: Sequence[FileMount] = (),
 ) -> str:
-    """Build dynamic CodeAct instructions for the effective sandbox state."""
+    """Build dynamic CodeAct instructions for the effective Monty tool set."""
+    tool_summaries = _format_tool_summaries(tools)
+    filesystem_text = _format_filesystem_capabilities(mounts)
+
     usage_note = (
-        "Some tools may also appear directly, but prefer `execute_code` whenever you need to combine Python "
-        "control flow with sandbox tool calls."
+        "Some tools may also appear directly, but prefer `execute_code` whenever you need to combine "
+        "Python control flow with sandbox tool calls."
         if tools_visible_to_model
         else "Provider-owned sandbox tools are not exposed separately; use `execute_code` when you need them."
     )
 
-    output_note = (
-        "To surface results from `execute_code`, end the code with `print(...)`; the sandbox does not "
-        "return the value of the last expression."
-    )
-    if filesystem_enabled:
-        output_note += (
-            " For larger artifacts, write them to `/output/<filename>` instead — returned files will be "
-            "attached to the tool result."
-        )
+    return f"""You have one primary tool: `execute_code`.
 
-    return f"""You have one primary tool: execute_code.
+Inside `execute_code`, call registered tools directly as async functions:
+`result = await tool_name(param=value)`. Always use `await` and keyword arguments.
+Your code is type-checked against the tool signatures below before execution.
+`await call_tool('name', **kwargs)` is also supported as a fallback but is not type-checked.
 
-Prefer one execute_code call per request when possible.
-Its tool description contains the current `call_tool(...)` guidance, sandbox
-tool registry, and capability limits.
+For fan-out, use `asyncio.gather`:
+`results = await asyncio.gather(tool_a(...), tool_b(...))`.
 
-{output_note}
+Surface results to the caller via `print(...)` (captured and returned as text)
+or by ending the code with an expression whose value is JSON-encodable - the
+value of the final expression is returned alongside captured stdout.
+
+Filesystem capabilities:
+{filesystem_text}
+
+Registered tools:
+{tool_summaries}
+
+Prefer a single `execute_code` call per request when possible, combining
+multiple tool calls with Python control flow.
 
 {usage_note}
 """
@@ -103,37 +98,28 @@ tool registry, and capability limits.
 def build_execute_code_description(
     *,
     tools: Sequence[FunctionTool],
-    filesystem_enabled: bool,
-    workspace_enabled: bool,
-    mounted_paths: Sequence[str],
-    allowed_domains: Sequence[AllowedDomain],
+    mounts: Sequence[FileMount] = (),
 ) -> str:
-    """Build the dynamic execute_code tool description for standalone usage."""
-    filesystem_text = _format_filesystem_capabilities(
-        filesystem_enabled=filesystem_enabled,
-        workspace_enabled=workspace_enabled,
-        mounted_paths=mounted_paths,
-    )
-    network_text = _format_network_capabilities(
-        allowed_domains=allowed_domains,
-    )
+    """Build the dynamic ``execute_code`` tool description for standalone usage."""
+    tool_summaries = _format_tool_summaries(tools)
+    filesystem_text = _format_filesystem_capabilities(mounts)
 
-    return f"""Execute Python in an isolated Hyperlight sandbox.
+    return f"""Execute Python code in a Monty interpreter.
 
-Inside the sandbox, `call_tool(name, **kwargs)` is available as a built-in for
-registered host callbacks. Use the tool name as the first argument and keyword
-arguments only. Do not pass a dict or any other positional arguments after the
-tool name.
+Inside the sandbox, call registered tools directly as typed async functions:
+`result = await tool_name(param=value)`. Always use `await` and keyword arguments.
+Code is type-checked against tool signatures before execution.
+`await call_tool('name', **kwargs)` is also supported as a fallback.
 
-Registered sandbox tools:
-{_format_tool_summaries(tools)}
+For fan-out, use `asyncio.gather`:
+`results = await asyncio.gather(tool_a(...), tool_b(...))`.
 
 Filesystem capabilities:
 {filesystem_text}
 
-Network capabilities:
-{network_text}
+Registered tools:
+{tool_summaries}
 
-Prefer `execute_code` when you need to combine one or more `call_tool(...)`
-calls with Python control flow, loops, or post-processing.
+Surface results via `print(...)` (captured and returned as text) or by ending
+with an expression whose value is JSON-encodable.
 """

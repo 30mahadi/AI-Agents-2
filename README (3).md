@@ -1,174 +1,74 @@
-# agent-framework-hosting-mcp
+# Get Started with Microsoft Agent Framework Mistral AI
 
-MCP conversion helpers for app-owned Agent Framework hosting.
+Please install this package:
 
-The package deliberately does not choose a web framework or wrap the MCP SDK
-server lifecycle. It provides two conversion functions and small adapters:
-
-- `mcp_to_run(...)` converts native MCP tool arguments into Agent Framework run
-  arguments.
-- `mcp_from_run(...)` converts an `AgentResponse` or `Message` into native MCP
-  `ContentBlock` values.
-- `AgentMCPTool(...)` generates the native `Tool` definition from an agent and
-  keeps listing, parsing, execution, result conversion, and optional
-  `AgentState` session persistence aligned.
-- `WorkflowMCPTool(...)` generates the native `Tool` definition from a
-  workflow's start-executor input type and converts completed workflow outputs.
-
-Application code keeps ownership of the MCP SDK's `Server`, handler
-registration, request context, transport, session-key policy, authentication,
-authorization, and deployment.
-
-For direct conversion, the argument name is part of the app-owned MCP tool
-contract. Define it once and use the same value in both the native tool schema
-and `mcp_to_run(...)`:
-
-```python
-agent_input_argument = "task"
-chat_option_arguments = {
-    "reasoning_effort": {
-        "type": "string",
-        "enum": ["low", "medium", "high"],
-    },
-}
-
-tool = Tool(
-    name="run_agent",
-    inputSchema={
-        "type": "object",
-        "properties": {
-            agent_input_argument: {"type": "string"},
-            **chat_option_arguments,
-        },
-        "required": [agent_input_argument],
-    },
-)
-run = mcp_to_run(
-    arguments,
-    argument_name=agent_input_argument,
-    chat_option_arguments=chat_option_arguments,
-)
+```bash
+pip install agent-framework-mistral --pre
 ```
 
-Only names listed in `chat_option_arguments` are copied to `run["options"]`;
-other MCP arguments remain available in the message's raw representation but
-are not forwarded to the model client. The native MCP schema remains
-responsible for validating exposed option types and ranges.
+and see the [README](https://github.com/microsoft/agent-framework/tree/main/python/README.md) for more information.
 
-For an agent exposed as one MCP tool, use the adapter so the schema and
-conversion cannot drift:
+See the [Mistral agent sample](../../samples/02-agents/providers/mistral/mistral_agent_basic.py) and the
+[Mistral embedding sample](../../samples/02-agents/providers/mistral/mistral_embeddings.py) for runnable examples.
 
-```python
-agent_tool = AgentMCPTool(
-    agent,
-    name="run_agent",
-    argument_description="The request for the hosted agent.",
-    parameters={"audience": {"type": "string"}},
-    chat_option_parameters={
-        "reasoning_effort": {
-            "type": "string",
-            "enum": ["low", "medium", "high"],
-        }
-    },
-)
+## Chat Client
 
-@server.list_tools()
-async def list_tools():
-    return await agent_tool.list_tools()
+The `MistralChatClient` provides chat completions using Mistral AI models, with support for
+streaming, function tools, and structured output.
 
-@server.call_tool()
-async def call_tool(name, arguments):
-    return await agent_tool.call_tool(name, arguments)
-```
-
-`AgentMCPTool` uses the agent's name and description unless overridden.
-`parameters` adds app-owned JSON Schema properties that remain available in the
-raw MCP arguments. `chat_option_parameters` adds properties and explicitly
-copies their values into Agent Framework chat options.
-
-For a workflow exposed as one MCP tool, use `WorkflowMCPTool`:
+### Quick Start
 
 ```python
-workflow_tool = WorkflowMCPTool(
-    WorkflowState(create_workflow, cache_target=False),
-    name="run_workflow",
-)
+from agent_framework import Agent
+from agent_framework.mistral import MistralChatClient
+
+# Using environment variables (MISTRAL_API_KEY, MISTRAL_CHAT_MODEL)
+# Parameters can also be passed directly:
+# MistralChatClient(model="mistral-large-latest", api_key="your-api-key")
+client = MistralChatClient()
+try:
+    agent = Agent(client=client, instructions="You are a helpful assistant.")
+    response = await agent.run("Hello!")
+    print(response.text)
+finally:
+    await client.close()
 ```
 
-The start executor must declare exactly one input type. Dataclass, Pydantic, and
-other object-shaped inputs become the MCP tool's top-level arguments. Primitive
-inputs are wrapped in the configurable `argument_name` property. The adapter
-validates MCP arguments against that derived type before calling
-`workflow.run(...)`.
+### Configuration
 
-Workflow instances preserve execution state, so applications that need
-independent calls should supply a `WorkflowState` factory with
-`cache_target=False`, as above. Checkpoint restoration, human-in-the-loop
-responses, and continuation identifiers remain application-owned contracts.
-If a workflow requests external input, the adapter raises instead of returning
-an empty successful tool result.
+| Environment Variable | Description |
+|---|---|
+| `MISTRAL_API_KEY` | Your Mistral AI API key |
+| `MISTRAL_CHAT_MODEL` | Chat model name (e.g., `mistral-large-latest`) |
+| `MISTRAL_SERVER_URL` | Optional server URL override |
 
-Pass an existing `AgentState` plus `session_id_parameter` to persist an
-`AgentSession`:
+## Embedding Client
+
+The `MistralEmbeddingClient` provides embedding generation using Mistral AI models.
+
+### Quick Start
 
 ```python
-state = AgentState(agent)
-agent_tool = AgentMCPTool(
-    state,
-    parameters={"session_id": {"type": "string", "minLength": 1}},
-    required_parameters={"session_id"},
-    session_id_parameter="session_id",
-)
+from agent_framework.mistral import MistralEmbeddingClient
+
+# Using environment variables (MISTRAL_API_KEY, MISTRAL_EMBEDDING_MODEL)
+client = MistralEmbeddingClient()
+
+try:
+    # Parameters can also be passed directly:
+    # MistralEmbeddingClient(model="mistral-embed", api_key="your-api-key")
+    result = await client.get_embeddings(["Hello, world!", "How are you?"])
+    for embedding in result:
+        print(f"Dimensions: {embedding.dimensions}")
+        print(f"Vector: {embedding.vector[:5]}...")
+finally:
+    await client.close()
 ```
 
-The application must authenticate or authorize that session identifier and
-serialize concurrent calls for the same session. The adapter only performs the
-`AgentState` session-store get/run/set sequence. A configured session parameter
-is always marked required in the generated MCP schema.
+### Configuration
 
-The session identifier is an opaque, application-defined key. Neither MCP nor
-Agent Framework prescribes its format. `AgentMCPTool` treats it as the key for
-one mutable conversation: each call loads that session and stores the updated
-session under the same key. It does not implement
-`previous_response_id`-style branching. Branching requires an app-owned
-contract with separate source and destination identifiers so the application
-can authorize both, copy the source session, and store the result under the
-destination key.
-
-MCP `tools/call` inputs are JSON objects defined by the app's `inputSchema`;
-the protocol does not define image, audio, or resource content blocks for tool
-arguments. This helper therefore converts one selected string argument and
-does not impose a non-standard multimodal JSON convention.
-
-For non-image/audio binary output, `mcp_from_run(...)` uses an app-provided
-`content.additional_properties["uri"]` when present and otherwise uses the
-short fallback `af://binary`; the payload itself is stored only in the MCP
-resource's `blob` field.
-
-`mcp_from_run(...)` targets `CallToolResult.content`, whose MCP content union
-does not include sampling-only `ToolUseContent`. Agent Framework
-`function_call` content is therefore omitted from tool results. MCP sampling
-callbacks use a separate response contract and may convert function calls to
-`ToolUseContent`.
-
-MCP tool calls return one final `CallToolResult`; they do not stream partial
-content blocks. Streamable HTTP may carry multiple MCP messages, and apps may
-send progress notifications while work runs, but neither mechanism turns
-Agent Framework response updates into incremental tool results. Experimental
-MCP tasks defer retrieval of the same final result.
-
-```python
-run = mcp_to_run(arguments)
-result = await agent.run(
-    run["messages"],
-    options=run["options"],
-)
-content = mcp_from_run(result)
-
-# Native MCP SDK application code returns `content` from its call_tool handler.
-```
-
-The surrounding MCP application still owns the low-level `Server`, handler
-registration, Starlette/FastAPI composition, stdio or streamable HTTP
-transport, request authentication, session-key trust, concurrency, and
-deployment.
+| Environment Variable | Description |
+|---|---|
+| `MISTRAL_API_KEY` | Your Mistral AI API key |
+| `MISTRAL_EMBEDDING_MODEL` | Embedding model name (e.g., `mistral-embed`) |
+| `MISTRAL_SERVER_URL` | Optional server URL override |

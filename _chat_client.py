@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import base64
+import hashlib
 import json
 import logging
+import re
 import sys
-from collections.abc import AsyncIterable, Awaitable, Callable, Mapping, Sequence
-from typing import Any, ClassVar, Generic, cast
-from uuid import uuid4
+from collections.abc import AsyncIterable, Awaitable, Mapping, Sequence
+from datetime import datetime, timezone
+from typing import Any, ClassVar, Generic, Literal, cast
 
+import httpx
 from agent_framework import (
     BaseChatClient,
     ChatAndFunctionMiddlewareTypes,
@@ -25,17 +27,18 @@ from agent_framework import (
     Message,
     ResponseStream,
     UsageDetails,
-    detect_media_type_from_base64,
     validate_tool_mode,
 )
 from agent_framework._settings import SecretString, load_settings
 from agent_framework._telemetry import get_user_agent, mark_feature_used
-from agent_framework._types import _get_data_bytes  # type: ignore[reportPrivateUsage]
-from agent_framework.exceptions import ContentError
+from agent_framework._types import prepend_instructions_to_messages
+from agent_framework.exceptions import (
+    ChatClientException,
+    ChatClientInvalidAuthException,
+    ChatClientInvalidRequestException,
+    ChatClientInvalidResponseException,
+)
 from agent_framework.observability import ChatTelemetryLayer
-from google import genai
-from google.auth.credentials import Credentials
-from google.genai import types
 from pydantic import BaseModel
 
 from ._feature_usage import FeatureIndex
@@ -55,16 +58,7 @@ if sys.version_info >= (3, 11):
 else:
     from typing_extensions import TypedDict  # pragma: no cover
 
-logger = logging.getLogger("agent_framework.gemini")
-
-__all__ = [
-    "GeminiChatClient",
-    "GeminiChatOptions",
-    "GeminiSettings",
-    "GoogleGeminiSettings",
-    "RawGeminiChatClient",
-    "ThinkingConfig",
-]
+logger = logging.getLogger("agent_framework.mistral")
 
 ResponseModelT = TypeVar("ResponseModelT", bound=BaseModel | None, default=None)
 
@@ -72,460 +66,321 @@ ResponseModelT = TypeVar("ResponseModelT", bound=BaseModel | None, default=None)
 # region Options & Settings
 
 
-class ThinkingConfig(TypedDict, total=False):
-    """Extended thinking configuration for Gemini models.
+class MistralChatOptions(ChatOptions[ResponseModelT], Generic[ResponseModelT], total=False):
+    """Mistral AI-specific chat options.
 
-    Attributes:
-        include_thoughts: Whether to include thought summaries in the response. Thought summaries
-            are condensed representations of the model's internal reasoning and appear as response
-            parts where ``part.thought`` is ``True``. When set, the framework surfaces these parts
-            as ``text_reasoning`` content in ``ChatResponse.contents``.
-        thinking_budget: Token budget for Gemini 2.5 models. Set to ``0`` to disable
-            thinking or ``-1`` to enable a dynamic budget.
-        thinking_level: Thinking level for Gemini 2.5 models and later. One of
-            ``ThinkingLevel.THINKING_LEVEL_UNSPECIFIED`` (default), ``ThinkingLevel.MINIMAL``,
-            ``ThinkingLevel.LOW``, ``ThinkingLevel.MEDIUM``, or ``ThinkingLevel.HIGH``.
-    """
+    Extends ``ChatOptions`` with Mistral-specific fields. Standard options are mapped to their
+    Mistral chat-completion equivalents; Mistral-specific fields are declared below.
 
-    include_thoughts: bool
-    thinking_budget: int
-    thinking_level: types.ThinkingLevel
-
-
-class GeminiChatOptions(ChatOptions[ResponseModelT], Generic[ResponseModelT], total=False):
-    """Google Gemini API-specific chat options.
-
-    Extends ``ChatOptions`` with Gemini-specific fields. Standard options are mapped to their
-    ``GenerateContentConfig`` equivalents; Gemini-specific fields are declared below.
-
-    Only text output is supported for now. Other modalities may be added later.
-
-    See: https://ai.google.dev/api/generate-content#generationconfig
+    See: https://docs.mistral.ai/api/#tag/chat
 
     Inherited fields from ``ChatOptions``:
-        model: Model to use for this call (e.g. ``"gemini-2.5-flash"``).
+        model: Model to use for this call (e.g. ``"mistral-large-latest"``).
         temperature: Controls randomness. Higher values produce more varied output.
-        max_tokens: Maximum number of tokens to generate (``maxOutputTokens``).
-        top_p: Nucleus sampling cutoff. Only tokens within the top-p probability mass are considered.
-        stop: One or more sequences that stop generation when encountered (``stopSequences``).
-        seed: Fixed seed for reproducible outputs.
-        frequency_penalty: Reduces repetition by penalising tokens that appear frequently.
-        presence_penalty: Reduces repetition by penalising tokens that have already appeared.
-        tools: Function tools the model may call. Accepts ``FunctionTool`` instances, plain callables,
-            or ``types.Tool`` objects returned by ``get_code_interpreter_tool``, ``get_web_search_tool``,
-            ``get_mcp_tool``, ``get_file_search_tool``, or ``get_maps_grounding_tool``.
+        max_tokens: Maximum number of tokens to generate.
+        top_p: Nucleus sampling cutoff.
+        stop: One or more sequences that stop generation when encountered.
+        seed: Fixed seed for reproducible outputs, translates to ``random_seed``.
+        frequency_penalty: Reduces repetition by penalising frequent tokens.
+        presence_penalty: Reduces repetition by penalising tokens already present.
+        tools: Function tools the model may call.
         tool_choice: How the model picks a tool. One of ``'auto'``, ``'none'``, or ``'required'``.
+        allow_multiple_tool_calls: Translates to ``parallel_tool_calls``.
         response_format: Pydantic model type or JSON schema mapping for structured JSON output.
             The response text is parsed and exposed via ``ChatResponse.value``.
         instructions: Extra system-level instructions prepended to the system message.
+        metadata: Arbitrary key/value metadata attached to the request.
 
     Not supported, and passing these raises a type error:
         - ``logit_bias``
-        - ``allow_multiple_tool_calls``
         - ``store``
         - ``user``
-        - ``metadata``
         - ``conversation_id``
     """
 
-    # Gemini's GenerationConfig options
-    response_schema: dict[str, Any]
-    """Raw JSON schema dict for structured output (alternative to ``response_format``).
-    Sets ``response_mime_type`` to ``'application/json'`` and passes the schema directly."""
+    safe_prompt: bool
+    """Whether to inject a safety prompt before all conversations."""
 
-    top_k: int
-    """Top-K sampling: limits token selection to the K most probable tokens."""
+    prompt_mode: str
+    """Toggle between reasoning mode and no system prompt (e.g. ``"reasoning"``)."""
 
-    thinking_config: ThinkingConfig
-    """Extended thinking configuration. See ``ThinkingConfig`` for available fields."""
+    prediction: dict[str, Any]
+    """Predicted output to optimize response time when large parts of the response are known."""
+
+    guardrails: list[dict[str, Any]]
+    """Guardrail configurations applied to the request."""
+
+    prompt_cache_key: str
+    """Cache key shared by requests with the same prompt prefix."""
+
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+    """Effort level for models that support reasoning."""
 
     # Unsupported base options. Override with None to indicate not supported
     logit_bias: None  # type: ignore[misc]
-    """Not supported in the Gemini API."""
-
-    allow_multiple_tool_calls: None  # type: ignore[misc]
-    """Not supported. Gemini handles parallel tool calls automatically."""
+    """Not supported in the Mistral API."""
 
     store: None  # type: ignore[misc]
-    """Not supported in the Gemini API."""
+    """Not supported in the Mistral API."""
 
     user: None  # type: ignore[misc]
-    """Not supported in the Gemini API."""
-
-    metadata: None  # type: ignore[misc]
-    """Not supported in the Gemini API."""
+    """Not supported in the Mistral API."""
 
     conversation_id: None  # type: ignore[misc]
-    """Not supported in the Gemini API."""
+    """Not supported in the Mistral API."""
 
 
-GeminiChatOptionsT = TypeVar("GeminiChatOptionsT", bound=TypedDict, default="GeminiChatOptions", covariant=True)  # type: ignore[valid-type]
+MistralChatOptionsT = TypeVar("MistralChatOptionsT", bound=TypedDict, default="MistralChatOptions", covariant=True)  # type: ignore[valid-type]
 
 
-class GeminiSettings(TypedDict, total=False):
-    """Gemini configuration settings loaded from environment or .env files."""
+class MistralSettings(TypedDict, total=False):
+    """Mistral AI chat settings.
+
+    Fields:
+        api_key: Mistral API key. Resolved from ``MISTRAL_API_KEY``.
+        chat_model: Chat model name. Resolved from ``MISTRAL_CHAT_MODEL``.
+        server_url: Optional server URL override. Resolved from ``MISTRAL_SERVER_URL``.
+    """
 
     api_key: SecretString | None
-    model: str | None
-
-
-class GoogleGeminiSettings(TypedDict, total=False):
-    """Google SDK configuration settings loaded from ``GOOGLE_*`` environment variables."""
-
-    api_key: SecretString | None
-    model: str | None
-    genai_use_vertexai: bool | None
-    cloud_project: str | None
-    cloud_location: str | None
+    chat_model: str | None
+    server_url: str | None
 
 
 # endregion
 
+_MISTRAL_API_BASE_URL = "https://api.mistral.ai"
+_CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
+_DEFAULT_TIMEOUT_SECONDS = 60.0
+_SSE_DATA_PREFIX = "data:"
+_SSE_DONE = "[DONE]"
 
-_GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com"
-_VERTEX_AI_BASE_URL = "https://aiplatform.googleapis.com"
-
-
-def _resolve_vertexai_mode(client: genai.Client, *, fallback: bool | None = None) -> bool:
-    """Resolve whether a client targets Vertex AI, preferring the instantiated SDK client state."""
-    api_client = getattr(client, "_api_client", None)
-    vertexai = getattr(api_client, "vertexai", None)
-    if isinstance(vertexai, bool):
-        return vertexai
-    return bool(fallback)
-
-
-def _resolve_service_url(client: genai.Client, *, vertexai: bool) -> str:
-    """Resolve the base service URL from the instantiated SDK client, with a stable fallback."""
-    api_client = getattr(client, "_api_client", None)
-    http_options = getattr(api_client, "_http_options", None)
-    base_url = getattr(http_options, "base_url", None)
-    if isinstance(base_url, str) and base_url:
-        return base_url.rstrip("/")
-    return _VERTEX_AI_BASE_URL if vertexai else _GEMINI_API_BASE_URL
-
-
-def _validate_client_auth_configuration(
-    *,
-    vertexai: bool | None,
-    api_key: SecretString | None,
-    project: str | None,
-    location: str | None,
-    credentials: Credentials | None,
-) -> None:
-    """Validate supported auth combinations before instantiating the SDK client."""
-    if vertexai is not True:
-        if api_key is None:
-            raise ValueError(
-                "Gemini client requires an API key when Vertex AI is not enabled. "
-                "Set GOOGLE_API_KEY or GEMINI_API_KEY, or pass api_key explicitly."
-            )
-        return
-
-    if api_key is not None or credentials is not None or (project and location):
-        return
-
-    if project or location:
-        raise ValueError(
-            "Gemini client requires both GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION "
-            "when Vertex AI is enabled without an API key."
-        )
-
-    raise ValueError(
-        "Gemini client requires Vertex AI credentials or configuration when Vertex AI is enabled. "
-        "Provide GOOGLE_API_KEY for Vertex AI express mode, pass credentials, or set "
-        "GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION."
-    )
-
-
-# Keys mapping to a different GenerateContentConfig field name
+# Keys mapping to a different Mistral chat-completion parameter name
 _OPTION_TRANSLATIONS: dict[str, str] = {
-    "max_tokens": "max_output_tokens",
-    "stop": "stop_sequences",
+    "seed": "random_seed",
+    "allow_multiple_tool_calls": "parallel_tool_calls",
 }
 
 # Keys handled with dedicated logic, not via the generic passthrough
-_OPTION_EXPLICIT_KEYS: frozenset[str] = frozenset({
-    "tools",
-    "tool_choice",
-    "response_format",
-    "response_schema",
-    "thinking_config",
-})
+_OPTION_EXPLICIT_KEYS: frozenset[str] = frozenset(
+    {
+        "tools",
+        "tool_choice",
+        "response_format",
+    }
+)
 
-# Keys consumed upstream and not forwarded to GenerateContentConfig
-_OPTION_CONSUMED_KEYS: frozenset[str] = frozenset({
-    "model",
-    "instructions",
-})
+# Keys consumed upstream and not forwarded to the Mistral API
+_OPTION_CONSUMED_KEYS: frozenset[str] = frozenset(
+    {
+        "model",
+        "instructions",
+    }
+)
 
 _OPTION_EXCLUDE_KEYS: frozenset[str] = _OPTION_EXPLICIT_KEYS | _OPTION_CONSUMED_KEYS
 
-_JSON_SCHEMA_TYPES: frozenset[str] = frozenset({
-    "array",
-    "boolean",
-    "integer",
-    "null",
-    "number",
-    "object",
-    "string",
-})
-
-_JSON_SCHEMA_KEYWORDS: frozenset[str] = frozenset({
-    "$defs",
-    "additionalProperties",
-    "allOf",
-    "anyOf",
-    "enum",
-    "items",
-    "oneOf",
-    "properties",
-    "required",
-    "type",
-})
-
 _FINISH_REASON_MAP: dict[str, FinishReasonLiteral] = {
-    "STOP": "stop",
-    "MAX_TOKENS": "length",
-    "SAFETY": "content_filter",
-    "RECITATION": "content_filter",
-    "LANGUAGE": "content_filter",
-    "BLOCKLIST": "content_filter",
-    "PROHIBITED_CONTENT": "content_filter",
-    "SPII": "content_filter",
-    "IMAGE_SAFETY": "content_filter",
-    "IMAGE_PROHIBITED_CONTENT": "content_filter",
-    "IMAGE_RECITATION": "content_filter",
-    "MALFORMED_FUNCTION_CALL": "tool_calls",
-    "UNEXPECTED_TOOL_CALL": "tool_calls",
+    "stop": "stop",
+    "length": "length",
+    "model_length": "length",
+    "tool_calls": "tool_calls",
 }
 
+# La Plateforme requires tool call IDs to be exactly 9 alphanumeric characters.
+_MISTRAL_TOOL_CALL_ID_PATTERN = re.compile(r"^[a-zA-Z0-9]{9}$")
 
-class RawGeminiChatClient(
-    BaseChatClient[GeminiChatOptionsT],
-    Generic[GeminiChatOptionsT],
+
+def _sanitize_tool_call_id(call_id: str) -> str:
+    """Return a Mistral-compatible tool call ID, deterministically derived when needed."""
+    if _MISTRAL_TOOL_CALL_ID_PATTERN.match(call_id):
+        return call_id
+    return hashlib.sha256(call_id.encode("utf-8")).hexdigest()[:9]
+
+
+def _tool_call_id_of(tool_call: Mapping[str, Any]) -> str:
+    """Return the wire tool call ID, treating null/"null" placeholders as missing."""
+    call_id = tool_call.get("id")
+    if isinstance(call_id, str) and call_id and call_id != "null":
+        return call_id
+    return ""
+
+
+def _function_call_content(tool_call: Mapping[str, Any]) -> Content:
+    function: Mapping[str, Any] = tool_call.get("function") or {}
+    arguments = function.get("arguments")
+    if isinstance(arguments, str):
+        normalized_arguments: str | dict[str, Any] = arguments
+    elif isinstance(arguments, dict):
+        normalized_arguments = cast("dict[str, Any]", arguments)
+    else:
+        normalized_arguments = str(cast(object, arguments))
+    return Content.from_function_call(
+        call_id=_tool_call_id_of(tool_call),
+        name=function.get("name") or "",
+        arguments=normalized_arguments,
+        raw_representation=tool_call,
+    )
+
+
+class _StreamedToolCalls:
+    """Correlates streamed tool-call fragments by ``(choice index, tool-call index)``.
+
+    Mistral may interleave fragments of parallel calls and omit ``id`` on
+    continuations, so a call is only emitted once it is complete: when its
+    choice finishes, when its index is reused by a new call, or at stream end.
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict[tuple[int, int | str], dict[str, Any]] = {}
+        self._auto_key_count = 0
+
+    def add(self, choice_index: int, fragment: Mapping[str, Any]) -> list[Content]:
+        """Fold a fragment into its pending call; returns calls completed by an index reuse."""
+        flushed: list[Content] = []
+        key = self._key_for(choice_index, fragment)
+        pending = self._pending.get(key)
+        if pending is not None:
+            fragment_id = _tool_call_id_of(fragment)
+            if fragment_id and (pending_id := _tool_call_id_of(pending)) and pending_id != fragment_id:
+                flushed.append(_function_call_content(self._pending.pop(key)))
+                pending = None
+        if pending is None:
+            self._pending[key] = {**fragment, "function": dict(fragment.get("function") or {})}
+        else:
+            self._merge(pending, fragment)
+        return flushed
+
+    def flush_choice(self, choice_index: int) -> list[Content]:
+        keys = [key for key in self._pending if key[0] == choice_index]
+        return [_function_call_content(self._pending.pop(key)) for key in keys]
+
+    def flush_all(self) -> list[Content]:
+        contents = [_function_call_content(pending) for pending in self._pending.values()]
+        self._pending.clear()
+        return contents
+
+    def _key_for(self, choice_index: int, fragment: Mapping[str, Any]) -> tuple[int, int | str]:
+        index = fragment.get("index")
+        if isinstance(index, int):
+            return (choice_index, index)
+        if fragment_id := _tool_call_id_of(fragment):
+            for key, pending in self._pending.items():
+                if key[0] == choice_index and _tool_call_id_of(pending) == fragment_id:
+                    return key
+        else:
+            for key in reversed(self._pending):
+                if key[0] == choice_index:
+                    return key
+        self._auto_key_count += 1
+        return (choice_index, f"auto-{self._auto_key_count}")
+
+    @staticmethod
+    def _merge(pending: dict[str, Any], fragment: Mapping[str, Any]) -> None:
+        if fragment_id := _tool_call_id_of(fragment):
+            pending["id"] = fragment_id
+        function: Mapping[str, Any] = fragment.get("function") or {}
+        pending_function: dict[str, Any] = pending["function"]
+        if (name := function.get("name")) and not pending_function.get("name"):
+            pending_function["name"] = name
+        new_arguments = function.get("arguments")
+        old_arguments = pending_function.get("arguments")
+        if new_arguments is None:
+            return
+        if isinstance(old_arguments, str) and isinstance(new_arguments, str):
+            pending_function["arguments"] = old_arguments + new_arguments
+        elif isinstance(old_arguments, dict) and isinstance(new_arguments, dict):
+            cast("dict[str, Any]", old_arguments).update(cast("dict[str, Any]", new_arguments))
+        else:
+            pending_function["arguments"] = new_arguments
+
+
+class RawMistralChatClient(
+    BaseChatClient[MistralChatOptionsT],
+    Generic[MistralChatOptionsT],
 ):
-    """A raw Gemini chat client for Gemini Developer API or Vertex AI.
+    """A raw Mistral AI chat client.
+
+    Talks to the Mistral REST API directly over HTTP; the ``mistralai`` SDK is not required.
 
     Use this when you want full control over the request pipeline. For instance, to opt out of
     telemetry, use custom middleware, or compose your own layers. If you want the full-featured
-    client with batteries included, use `GeminiChatClient` instead.
+    client with batteries included, use `MistralChatClient` instead.
     """
 
-    OTEL_PROVIDER_NAME: ClassVar[str] = "gcp.gemini"
+    OTEL_PROVIDER_NAME: ClassVar[str] = "mistralai"
+
+    INJECTABLE: ClassVar[set[str]] = {"client"}
 
     def __init__(
         self,
         *,
-        api_key: str | None = None,
         model: str | None = None,
-        vertexai: bool | None = None,
-        project: str | None = None,
-        location: str | None = None,
-        credentials: Credentials | None = None,
+        api_key: str | SecretString | None = None,
+        server_url: str | None = None,
+        client: httpx.AsyncClient | None = None,
+        additional_properties: dict[str, Any] | None = None,
         env_file_path: str | None = None,
         env_file_encoding: str | None = None,
-        client: genai.Client | None = None,
-        additional_properties: dict[str, Any] | None = None,
     ) -> None:
-        """Create a raw Gemini chat client.
+        """Create a raw Mistral AI chat client.
 
-        Args:
-            api_key: Gemini Developer API key. Falls back to environment settings, preferring
-                ``GOOGLE_API_KEY`` over ``GEMINI_API_KEY``.
-            model: Default model identifier. Falls back to environment settings, preferring
-                ``GOOGLE_MODEL`` over ``GEMINI_MODEL``.
-            vertexai: Whether to use Vertex AI endpoints. Falls back to environment settings,
-                using ``GOOGLE_GENAI_USE_VERTEXAI`` when not passed explicitly.
-            project: Google Cloud project ID for Vertex AI. Falls back to environment settings,
-                using ``GOOGLE_CLOUD_PROJECT`` when not passed explicitly.
-            location: Vertex AI location. Falls back to environment settings, preferring
-                using ``GOOGLE_CLOUD_LOCATION`` when not passed explicitly.
-            credentials: Google Cloud credentials for Vertex AI. When omitted, the SDK can use
-                Application Default Credentials.
-            env_file_path: Path to a ``.env`` file for credential loading.
-            env_file_encoding: Encoding for the ``.env`` file.
-            client: Pre-built ``genai.Client`` instance. When provided, connector auth settings are not required.
-            additional_properties: Extra properties stored on the client instance.
+        Keyword Args:
+            model: The Mistral chat model to use (e.g. "mistral-large-latest").
+                Can also be set via environment variable ``MISTRAL_CHAT_MODEL``.
+            api_key: Mistral API key. Defaults to ``MISTRAL_API_KEY`` environment variable.
+            server_url: Optional server URL override. Defaults to ``MISTRAL_SERVER_URL``
+                environment variable, or the Mistral default.
+            client: Optional pre-configured ``httpx.AsyncClient``. When provided, api_key is
+                not required and the client is expected to carry its own auth headers and
+                base URL.
+            additional_properties: Additional properties stored on the client instance.
+            env_file_path: Path to ``.env`` file for settings.
+            env_file_encoding: Encoding for ``.env`` file.
         """
-        settings = load_settings(
-            GeminiSettings,
-            env_prefix="GEMINI_",
+        mistral_settings = load_settings(
+            MistralSettings,
+            env_prefix="MISTRAL_",
+            required_fields=[] if client is not None else ["api_key"],
             api_key=api_key,
-            model=model,
-            env_file_path=env_file_path,
-            env_file_encoding=env_file_encoding,
-        )
-        google_settings = load_settings(
-            GoogleGeminiSettings,
-            env_prefix="GOOGLE_",
-            api_key=api_key,
-            model=model,
-            genai_use_vertexai=vertexai,
-            cloud_project=project,
-            cloud_location=location,
+            chat_model=model,
+            server_url=server_url,
             env_file_path=env_file_path,
             env_file_encoding=env_file_encoding,
         )
 
-        configured_vertexai = google_settings.get("genai_use_vertexai")
-        if client:
-            self._genai_client = client
+        self.model = mistral_settings.get("chat_model")
+        self.server_url = mistral_settings.get("server_url")
+        self._owns_client = client is None
+
+        if client is not None:
+            self.client = client
+            if self.server_url is None:
+                client_base_url = str(client.base_url).rstrip("/")
+                self.server_url = client_base_url or None
         else:
-            resolved_key = google_settings.get("api_key") or settings.get("api_key")
-            resolved_project = google_settings.get("cloud_project")
-            resolved_location = google_settings.get("cloud_location")
-            _validate_client_auth_configuration(
-                vertexai=configured_vertexai,
-                api_key=resolved_key,
-                project=resolved_project,
-                location=resolved_location,
-                credentials=credentials,
+            resolved_api_key: SecretString = mistral_settings["api_key"]  # type: ignore[assignment]
+            self.client = httpx.AsyncClient(
+                base_url=self.server_url or _MISTRAL_API_BASE_URL,
+                headers={
+                    "Authorization": f"Bearer {resolved_api_key.get_secret_value()}",
+                    "User-Agent": get_user_agent(),
+                    "Accept": "application/json",
+                },
+                timeout=_DEFAULT_TIMEOUT_SECONDS,
             )
-
-            client_kwargs: dict[str, Any] = {
-                "http_options": {"headers": {"x-goog-api-client": get_user_agent()}},
-            }
-            if configured_vertexai is not None:
-                client_kwargs["vertexai"] = configured_vertexai
-
-            if resolved_key is not None and (
-                configured_vertexai is not True
-                or (credentials is None and not (resolved_project and resolved_location))
-            ):
-                client_kwargs["api_key"] = resolved_key.get_secret_value()
-
-            if configured_vertexai is True and resolved_project:
-                client_kwargs["project"] = resolved_project
-
-            if configured_vertexai is True and resolved_location:
-                client_kwargs["location"] = resolved_location
-            if configured_vertexai is True and credentials is not None:
-                client_kwargs["credentials"] = credentials
-
-            self._genai_client = genai.Client(**client_kwargs)
-
-        self._vertexai = _resolve_vertexai_mode(self._genai_client, fallback=configured_vertexai)
-        self._service_url = _resolve_service_url(self._genai_client, vertexai=self._vertexai)
-        self.model = google_settings.get("model") or settings.get("model")
 
         super().__init__(additional_properties=additional_properties)
 
-    @staticmethod
-    def get_code_interpreter_tool() -> types.Tool:
-        """Create a code execution tool.
+    async def close(self) -> None:
+        """Close the internally created HTTP client."""
+        if self._owns_client:
+            await self.client.aclose()
 
-        Pass the returned tool to the ``tools`` list of an agent or ``ChatOptions``.
-
-        Returns:
-            A ``types.Tool`` configured for sandboxed code execution.
-        """
-        return types.Tool(code_execution=types.ToolCodeExecution())
-
-    @staticmethod
-    def get_web_search_tool(
-        *,
-        search_types: types.SearchTypes | None = None,
-        blocking_confidence: types.PhishBlockThreshold | None = None,
-        exclude_domains: list[str] | None = None,
-        time_range_filter: types.Interval | None = None,
-    ) -> types.Tool:
-        """Create a Google Search grounding tool.
-
-        Pass the returned tool to the ``tools`` list of an agent or ``ChatOptions``.
-
-        Args:
-            search_types: Controls which search types are enabled (web search, image search).
-            blocking_confidence: Block sites at or above this phishing confidence level.
-                Not supported in Gemini API.
-            exclude_domains: List of domains to exclude from search results. Not supported in Gemini API.
-            time_range_filter: Restrict results to a specific time range. Not supported in Vertex AI.
-
-        Returns:
-            A ``types.Tool`` configured for Google Search grounding.
-        """
-        return types.Tool(
-            google_search=types.GoogleSearch(
-                search_types=search_types,
-                blocking_confidence=blocking_confidence,
-                exclude_domains=exclude_domains,
-                time_range_filter=time_range_filter,
-            )
-        )
-
-    @staticmethod
-    def get_mcp_tool(url: str, *, name: str | None = None, **kwargs: Any) -> types.Tool:
-        """Create an MCP (Model Context Protocol) server tool.
-
-        Pass the returned tool to the ``tools`` list of an agent or ``ChatOptions``.
-
-        Args:
-            url: The URL of the MCP server's streamable HTTP endpoint.
-            name: Optional display name for the MCP server.
-            **kwargs: Additional kwargs passed to ``StreamableHttpTransport``. Supported fields
-                include ``headers``, ``timeout``, ``sse_read_timeout``, and ``terminate_on_close``.
-
-        Returns:
-            A ``types.Tool`` configured for the given MCP server.
-        """
-        return types.Tool(
-            mcp_servers=[
-                types.McpServer(
-                    name=name,
-                    streamable_http_transport=types.StreamableHttpTransport(url=url, **kwargs),
-                )
-            ]
-        )
-
-    @staticmethod
-    def get_file_search_tool(
-        *,
-        file_search_store_names: list[str] | None = None,
-        top_k: int | None = None,
-        metadata_filter: str | None = None,
-    ) -> types.Tool:
-        """Create a file search tool backed by a Gemini file search store.
-
-        Pass the returned tool to the ``tools`` list of an agent or ``ChatOptions``.
-
-        Args:
-            file_search_store_names: Resource names of the file search stores to query.
-                Example: ``["fileSearchStores/my-file-search-store-123"]``.
-            top_k: Maximum number of retrieval chunks to return.
-            metadata_filter: CEL expression to filter retrieval results by metadata.
-                See https://google.aip.dev/160 for syntax.
-
-        Returns:
-            A ``types.Tool`` configured for file search retrieval.
-        """
-        return types.Tool(
-            file_search=types.FileSearch(
-                file_search_store_names=file_search_store_names,
-                top_k=top_k,
-                metadata_filter=metadata_filter,
-            )
-        )
-
-    @staticmethod
-    def get_maps_grounding_tool(
-        *,
-        enable_widget: bool | None = None,
-        auth_config: types.AuthConfig | None = None,
-    ) -> types.Tool:
-        """Create a Google Maps grounding tool.
-
-        Pass the returned tool to the ``tools`` list of an agent or ``ChatOptions``.
-
-        Args:
-            enable_widget: Return a widget context token in ``GroundingMetadata`` so callers
-                can render a Google Maps widget with geospatial context.
-            auth_config: Authentication config to access the Maps API. Only API key is
-                supported. Not supported in Gemini API.
-
-        Returns:
-            A ``types.Tool`` configured for Google Maps grounding.
-        """
-        return types.Tool(google_maps=types.GoogleMaps(enable_widget=enable_widget, auth_config=auth_config))
+    @override
+    def service_url(self) -> str:
+        """Get the URL of the service."""
+        return self.server_url or _MISTRAL_API_BASE_URL
 
     @override
     def _inner_get_response(
@@ -540,487 +395,277 @@ class RawGeminiChatClient(
 
             async def _stream() -> AsyncIterable[ChatResponseUpdate]:
                 validated = await self._validate_options(options)
-                model, contents, config = self._prepare_request(messages, validated)
-                mark_feature_used(FeatureIndex.GEMINI)
-                generate_content_stream = cast(
-                    Callable[..., Awaitable[AsyncIterable[types.GenerateContentResponse]]],
-                    cast(Any, self._genai_client.aio.models).generate_content_stream,
-                )
-                async for chunk in await generate_content_stream(
-                    model=model,
-                    contents=contents,
-                    config=config,
-                ):
-                    yield self._process_chunk(chunk)
+                request = self._prepare_request(messages, validated, **kwargs)
+                request["stream"] = True
+                mark_feature_used(FeatureIndex.MISTRAL)
+                tool_calls = _StreamedToolCalls()
+                try:
+                    async with self.client.stream("POST", _CHAT_COMPLETIONS_PATH, json=request) as response:
+                        await self._raise_for_status(response)
+                        async for line in response.aiter_lines():
+                            chunk = self._parse_sse_line(line)
+                            if chunk is not None:
+                                yield self._parse_chunk(chunk, tool_calls)
+                    if remaining := tool_calls.flush_all():
+                        yield ChatResponseUpdate(contents=remaining, role="assistant")
+                except ChatClientException:
+                    raise
+                except Exception as ex:
+                    raise ChatClientException(
+                        f"Mistral streaming chat request failed: {ex}",
+                        inner_exception=ex,
+                    ) from ex
 
             return self._build_response_stream(_stream(), response_format=options.get("response_format"))
 
         async def _get_response() -> ChatResponse:
             validated = await self._validate_options(options)
-            model, contents, config = self._prepare_request(messages, validated)
-            mark_feature_used(FeatureIndex.GEMINI)
-            raw = await self._genai_client.aio.models.generate_content(model=model, contents=contents, config=config)  # type: ignore[arg-type]
-            return self._process_generate_response(raw, response_format=validated.get("response_format"))
+            request = self._prepare_request(messages, validated, **kwargs)
+            mark_feature_used(FeatureIndex.MISTRAL)
+            try:
+                response = await self.client.post(_CHAT_COMPLETIONS_PATH, json=request)
+                await self._raise_for_status(response)
+            except ChatClientException:
+                raise
+            except Exception as ex:
+                raise ChatClientException(f"Mistral chat request failed: {ex}", inner_exception=ex) from ex
+            try:
+                raw_payload = response.json()
+                if not isinstance(raw_payload, Mapping):
+                    raise ChatClientInvalidResponseException("Mistral chat response must be a JSON object.")
+                payload = cast("Mapping[str, Any]", raw_payload)
+                return self._parse_response(payload, response_format=validated.get("response_format"))
+            except ChatClientException:
+                raise
+            except Exception as ex:
+                raise ChatClientInvalidResponseException(
+                    f"Mistral chat response was invalid: {ex}",
+                    inner_exception=ex,
+                ) from ex
 
         return _get_response()
 
-    @override
-    def service_url(self) -> str:
-        """Return the base URL of the configured Gemini or Vertex AI service.
+    @staticmethod
+    async def _raise_for_status(response: httpx.Response) -> None:
+        if response.status_code < 400:
+            return
+        body = (await response.aread()).decode("utf-8", errors="replace")
+        message = f"Mistral chat request failed with status {response.status_code}: {body[:2000]}"
+        if response.status_code in (401, 403):
+            raise ChatClientInvalidAuthException(message)
+        if response.status_code < 500:
+            raise ChatClientInvalidRequestException(message)
+        raise ChatClientException(message)
 
-        Returns:
-            The resolved service base URL.
-        """
-        return self._service_url
+    @staticmethod
+    def _parse_sse_line(line: str) -> dict[str, Any] | None:
+        """Parse one server-sent-events line into a completion chunk, or None to skip."""
+        line = line.strip()
+        if not line.startswith(_SSE_DATA_PREFIX):
+            return None
+        data = line[len(_SSE_DATA_PREFIX) :].strip()
+        if not data or data == _SSE_DONE:
+            return None
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError as ex:
+            raise ChatClientInvalidResponseException(
+                "Mistral streaming chat response contained malformed SSE data.",
+                inner_exception=ex,
+            ) from ex
+        if not isinstance(parsed, dict):
+            raise ChatClientInvalidResponseException("Mistral streaming chat SSE data must be a JSON object.")
+        return cast("dict[str, Any]", parsed)
 
     # region Request preparation
 
     def _prepare_request(
-        self,
-        messages: Sequence[Message],
-        options: Mapping[str, Any],
-    ) -> tuple[str, list[types.Content], types.GenerateContentConfig]:
-        """Resolve the model ID, convert messages to Gemini contents, and build the generation config.
-
-        Call this after awaiting ``_validate_options`` so that tools and other options are
-        fully normalized before the request is assembled.
+        self, messages: Sequence[Message], options: Mapping[str, Any], **kwargs: Any
+    ) -> dict[str, Any]:
+        """Build the JSON body for a Mistral chat-completion request.
 
         Args:
             messages: The conversation history as framework Message objects.
             options: Validated and normalized chat options.
+            kwargs: Additional keyword arguments merged into the request body.
 
         Returns:
-            A tuple of the resolved model, the Gemini contents list, and the generation config.
+            The request body for ``POST /v1/chat/completions``.
 
         Raises:
             ValueError: If no model is set on the options or the client instance.
         """
         model = options.get("model") or self.model
         if not model:
-            raise ValueError("Gemini model is required. Set via model parameter or GEMINI_MODEL environment variable.")
-
-        system_instruction, contents = self._prepare_gemini_messages(messages)
-        if call_instructions := options.get("instructions"):
-            system_instruction = (
-                f"{call_instructions}\n{system_instruction}" if system_instruction else call_instructions
+            raise ValueError(
+                "Mistral model is required. Set via model parameter or MISTRAL_CHAT_MODEL environment variable."
             )
 
-        return model, contents, self._prepare_config(options, system_instruction)
+        if instructions := options.get("instructions"):
+            messages = prepend_instructions_to_messages(list(messages), instructions, role="system")
 
-    def _prepare_gemini_messages(self, messages: Sequence[Message]) -> tuple[str | None, list[types.Content]]:
-        """Convert framework messages to Gemini contents and extract system instruction.
-
-        Args:
-            messages: The full conversation history as framework Message objects.
-
-        Returns:
-            A tuple of (system_instruction_text, contents_list). System messages are extracted
-            into the instruction string; tool results are grouped into user-role content blocks.
-        """
-        system_parts: list[str] = []
-        contents: list[types.Content] = []
-        # Maps call_id to function name so function_result parts can include the required name field.
-        call_id_to_name: dict[str, str] = {}
-        # Accumulated functionResponse parts from consecutive tool messages.
-        pending_tool_parts: list[types.Part] = []
-
-        def flush_pending_tool_parts() -> None:
-            if pending_tool_parts:
-                contents.append(types.Content(role="user", parts=list(pending_tool_parts)))
-                pending_tool_parts.clear()
-
-        for message in messages:
-            if message.role == "system":
-                if message.text:
-                    system_parts.append(message.text)
-                continue
-
-            if message.role == "tool":
-                for content in message.contents:
-                    part = self._convert_function_result(content, call_id_to_name)
-                    if part is not None:
-                        pending_tool_parts.append(part)
-                continue
-
-            # Non-tool message — flush any accumulated tool parts first.
-            flush_pending_tool_parts()
-
-            parts = self._convert_message_contents(message.contents, call_id_to_name)
-            if not parts:
-                continue
-
-            role = "model" if message.role == "assistant" else "user"
-            contents.append(types.Content(role=role, parts=parts))
-
-        flush_pending_tool_parts()
-
-        system_instruction = "\n".join(system_parts) if system_parts else None
-        return system_instruction, contents
-
-    def _convert_message_contents(
-        self,
-        message_contents: Sequence[Content],
-        call_id_to_name: dict[str, str],
-    ) -> list[types.Part]:
-        """Convert framework Content objects to Gemini Part objects, tracking function call IDs.
-
-        Args:
-            message_contents: The content items of a single framework message.
-            call_id_to_name: Mutable mapping updated with any function call ID-to-name pairs found.
-
-        Returns:
-            A list of Gemini Part objects representing the message contents.
-        """
-        parts: list[types.Part] = []
-        pending_signature: bytes | None = None
-        for content in message_contents:
-            if content.type == "text_reasoning":
-                # Gemini 3's thought_signature travels as base64 protected_data on reasoning content;
-                # hold it for the function call it precedes (reasoning is not sent back as a Part).
-                pending_signature = None
-                encoded_signature = content.protected_data
-                if isinstance(encoded_signature, str) and encoded_signature:
-                    try:
-                        pending_signature = base64.b64decode(encoded_signature, validate=True)
-                    except ValueError:
-                        logger.warning("Ignoring malformed thought_signature on reasoning content")
-                continue
-            # A signature applies only to a function call immediately following its reasoning content.
-            thought_signature = pending_signature
-            pending_signature = None
-            match content.type:
-                case "text":
-                    parts.append(types.Part(text=content.text or ""))
-                case "function_call":
-                    call_id = content.call_id or self._generate_tool_call_id()
-                    raw_part = content.raw_representation
-                    if (
-                        content.informational_only
-                        and isinstance(raw_part, types.Part)
-                        and raw_part.tool_call is not None
-                    ):
-                        tool_call = raw_part.tool_call.model_copy(
-                            update={
-                                "id": call_id,
-                                "args": content.parse_arguments() or {},
-                            },
-                            deep=True,
-                        )
-                        parts.append(raw_part.model_copy(update={"tool_call": tool_call}, deep=True))
-                        continue
-                    if content.name:
-                        call_id_to_name[call_id] = content.name
-                    function_call = types.FunctionCall(
-                        id=call_id,
-                        name=content.name or "",
-                        args=content.parse_arguments() or {},
-                    )
-                    # Echo the signature from the preceding reasoning content, backfilling only when
-                    # the raw Part lacks one.
-                    if isinstance(raw_part, types.Part) and raw_part.function_call is not None:
-                        replayed_part = raw_part.model_copy(update={"function_call": function_call}, deep=True)
-                        if replayed_part.thought_signature is None and thought_signature is not None:
-                            replayed_part.thought_signature = thought_signature
-                        parts.append(replayed_part)
-                    else:
-                        parts.append(types.Part(function_call=function_call, thought_signature=thought_signature))
-                case "function_result":
-                    raw_part = content.raw_representation
-                    if isinstance(raw_part, types.Part) and raw_part.tool_response is not None:
-                        tool_response = raw_part.tool_response.model_copy(
-                            update={
-                                "id": content.call_id or self._generate_tool_call_id(),
-                                "response": content.result,
-                            },
-                            deep=True,
-                        )
-                        parts.append(raw_part.model_copy(update={"tool_response": tool_response}, deep=True))
-                    else:
-                        logger.debug("Skipping unsupported content type for Gemini: %s", content.type)
-                case "data" | "uri":
-                    part = self._convert_data_or_uri_content(content)
-                    if part is not None:
-                        parts.append(part)
-                case _:
-                    logger.debug("Skipping unsupported content type for Gemini: %s", content.type)
-        return parts
-
-    def _convert_data_or_uri_content(self, content: Content) -> types.Part | None:
-        """Convert a ``data`` or ``uri`` Content to a Gemini Part.
-
-        Data URIs (``type="data"``) become ``inline_data`` Parts with the decoded bytes.
-        External URIs (``type="uri"``) become ``file_data`` Parts referencing the resource.
-
-        Args:
-            content: The framework Content object, expected to be of type ``data`` or ``uri``.
-
-        Returns:
-            A Gemini Part carrying the multimodal content, or None if the content cannot be
-            converted (e.g. missing URI, non-base64 data URI, or undecodable data).
-        """
-        uri = content.uri
-        if not uri:
-            logger.warning("Skipping %s content for Gemini: missing uri", content.type)
-            return None
-
-        if uri.startswith("data:"):
-            try:
-                raw_bytes = _get_data_bytes(content)
-            except ContentError:
-                logger.warning("Skipping data content for Gemini: data URI is not valid base64")
-                return None
-            if not raw_bytes:
-                logger.warning("Skipping data content for Gemini: no data found in URI")
-                return None
-            mime_type = content.media_type or detect_media_type_from_base64(data_bytes=raw_bytes)
-            if not mime_type:
-                logger.warning("Skipping data content for Gemini: missing media_type")
-                return None
-            return types.Part.from_bytes(data=raw_bytes, mime_type=mime_type)
-
-        try:
-            return types.Part.from_uri(file_uri=uri, mime_type=content.media_type)
-        except ValueError:
-            # from_uri raises when no media_type is given and one cannot be inferred from the URI
-            # (e.g. presigned URLs or API endpoints without an extension). Pass the URI through
-            # without a mime type rather than dropping the content or raising.
-            logger.warning("Could not determine media_type for URI content; sending to Gemini without one: %s", uri)
-            return types.Part(file_data=types.FileData(file_uri=uri, mime_type=None))
-
-    def _convert_function_result(
-        self,
-        content: Content,
-        call_id_to_name: dict[str, str],
-    ) -> types.Part | None:
-        """Convert a function_result Content to a Gemini FunctionResponse Part.
-
-        Args:
-            content: The framework Content object, expected to be of type ``function_result``.
-            call_id_to_name: Mapping of call IDs to function names, used to resolve the required name field.
-
-        Returns:
-            A Gemini Part containing a FunctionResponse, or None if the content type is not
-            ``function_result`` or the call ID cannot be resolved.
-        """
-        if content.type != "function_result":
-            return None
-
-        raw_part = content.raw_representation
-        if isinstance(raw_part, types.Part) and raw_part.tool_response is not None:
-            tool_response = raw_part.tool_response.model_copy(
-                update={
-                    "id": content.call_id or self._generate_tool_call_id(),
-                    "response": content.result,
-                },
-                deep=True,
-            )
-            return raw_part.model_copy(update={"tool_response": tool_response}, deep=True)
-
-        name = call_id_to_name.get(content.call_id or "")
-        if not name:
-            logger.warning(
-                "Skipping function_result: no matching function_call found for call_id=%r",
-                content.call_id,
-            )
-            return None
-
-        response = self._coerce_to_dict(content.result)
-        return types.Part(
-            function_response=types.FunctionResponse(
-                id=content.call_id,
-                name=name,
-                response=response,
-            )
-        )
-
-    @staticmethod
-    def _coerce_to_dict(value: Any) -> dict[str, Any]:
-        """Ensure a tool result value is a dict as required by Gemini's FunctionResponse.
-
-        Args:
-            value: The raw tool result. May be a dict, JSON string, plain string, None, or any other value.
-
-        Returns:
-            A dict representation of the value. JSON strings are parsed; all other non-dict values
-            are wrapped as ``{"result": <str(value)>}``.
-        """
-        if isinstance(value, dict):
-            return cast(dict[str, Any], value)
-        if isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-                if isinstance(parsed, dict):
-                    return cast(dict[str, Any], parsed)
-            except (json.JSONDecodeError, ValueError):
-                pass
-            return {"result": value}
-        if value is None:
-            return {"result": ""}
-        return {"result": str(value)}
-
-    def _prepare_config(
-        self,
-        options: Mapping[str, Any],
-        system_instruction: str | None,
-    ) -> types.GenerateContentConfig:
-        """Build a ``types.GenerateContentConfig`` from the resolved chat options.
-
-        Note: ``_OPTION_TRANSLATIONS`` keys are renamed, ``_OPTION_EXCLUDE_KEYS`` are skipped, and all
-        remaining keys are forwarded as-is, allowing new Gemini parameters to be adopted without
-        framework changes.
-
-        Args:
-            options: Resolved chat options mapping, typically a ``GeminiChatOptions`` dict.
-            system_instruction: Combined system instruction text, or None if absent.
-
-        Returns:
-            A fully populated ``GenerateContentConfig`` ready to pass to the Gemini API.
-        """
-        kwargs: dict[str, Any] = {}
-
-        if system_instruction:
-            kwargs["system_instruction"] = system_instruction
+        request: dict[str, Any] = {
+            "model": model,
+            "messages": self._prepare_mistral_messages(messages),
+        }
 
         for key, value in options.items():
             if key in _OPTION_EXCLUDE_KEYS or value is None:
                 continue
-            kwargs[_OPTION_TRANSLATIONS.get(key, key)] = value
+            request[_OPTION_TRANSLATIONS.get(key, key)] = value
 
-        response_format = options.get("response_format")
-        response_schema = options.get("response_schema")
-        if response_format is not None or response_schema is not None:
-            kwargs["response_mime_type"] = "application/json"
-        if response_schema is not None:
-            kwargs["response_schema"] = response_schema
-        elif (schema := self._extract_response_schema(response_format)) is not None:
-            kwargs["response_schema"] = schema
-        tools = self._prepare_tools(options)
-        if tools:
-            kwargs["tools"] = tools
-        tool_config = self._prepare_tool_config(options.get("tool_choice"))
-        if tools and not self._vertexai and self._requires_server_side_tool_invocations(tools):
-            tool_config = tool_config or types.ToolConfig()
-            tool_config.include_server_side_tool_invocations = True
-        if tool_config:
-            kwargs["tool_config"] = tool_config
-        if thinking_config := options.get("thinking_config"):
-            thinking_config_kwargs = {k: v for k, v in thinking_config.items() if v is not None}
-            if thinking_config_kwargs:
-                kwargs["thinking_config"] = types.ThinkingConfig(**thinking_config_kwargs)
+        if tools := self._prepare_tools(options.get("tools")):
+            request["tools"] = tools
+        if (tool_choice := self._prepare_tool_choice(options.get("tool_choice"))) is not None:
+            request["tool_choice"] = tool_choice
+        if (response_format := self._prepare_response_format(options.get("response_format"))) is not None:
+            request["response_format"] = response_format
 
-        return types.GenerateContentConfig(**kwargs)
+        request.update(kwargs)
+        return request
 
-    @staticmethod
-    def _extract_response_schema(response_format: Any) -> dict[str, Any] | None:
-        """Extract a Gemini response schema from supported mapping response_format shapes."""
-        if not isinstance(response_format, Mapping):
+    def _prepare_mistral_messages(self, messages: Sequence[Message]) -> list[dict[str, Any]]:
+        mistral_messages: list[dict[str, Any]] = []
+        for message in messages:
+            match message.role:
+                case "system":
+                    if message.text:
+                        mistral_messages.append({"role": "system", "content": message.text})
+                case "user":
+                    mistral_messages.append(self._format_user_message(message))
+                case "assistant":
+                    mistral_messages.append(self._format_assistant_message(message))
+                case "tool":
+                    mistral_messages.extend(self._format_tool_messages(message))
+                case _:
+                    logger.debug("Skipping unsupported message role for Mistral: %s", message.role)
+        return mistral_messages
+
+    def _format_user_message(self, message: Message) -> dict[str, Any]:
+        chunks: list[dict[str, Any]] = []
+        text_only = True
+        for content in message.contents:
+            match content.type:
+                case "text":
+                    chunks.append({"type": "text", "text": content.text or ""})
+                case "data" | "uri":
+                    chunk = self._convert_data_or_uri_content(content)
+                    if chunk is not None:
+                        chunks.append(chunk)
+                        text_only = False
+                case _:
+                    logger.debug("Skipping unsupported user content type for Mistral: %s", content.type)
+
+        if text_only:
+            return {"role": "user", "content": message.text}
+        return {"role": "user", "content": chunks}
+
+    def _convert_data_or_uri_content(self, content: Content) -> dict[str, Any] | None:
+        """Convert a ``data`` or ``uri`` Content to a Mistral content chunk.
+
+        Images become ``image_url`` chunks (data URIs are passed through as-is).
+        PDF documents referenced by external URI become ``document_url`` chunks.
+        """
+        uri = content.uri
+        if not uri:
+            logger.warning("Skipping %s content for Mistral: missing uri", content.type)
             return None
-        mapping = cast("Mapping[str, Any]", response_format)
 
-        if (nested := RawGeminiChatClient._extract_response_schema(mapping.get("format"))) is not None:
-            return nested
+        if content.has_top_level_media_type("image"):
+            return {"type": "image_url", "image_url": uri}
 
-        json_schema = mapping.get("json_schema")
-        if isinstance(json_schema, Mapping):
-            schema = cast("Mapping[str, Any]", json_schema).get("schema")
-            if isinstance(schema, Mapping):
-                return dict(cast("Mapping[str, Any]", schema))
+        if content.type == "uri" and content.media_type == "application/pdf":
+            return {"type": "document_url", "document_url": uri}
 
-        schema = mapping.get("schema")
-        if isinstance(schema, Mapping):
-            return dict(cast("Mapping[str, Any]", schema))
-
-        if RawGeminiChatClient._is_json_schema_mapping(mapping):
-            return dict(mapping)
-
+        logger.warning(
+            "Skipping unsupported %s content for Mistral: media_type=%s",
+            content.type,
+            content.media_type,
+        )
         return None
 
+    def _format_assistant_message(self, message: Message) -> dict[str, Any]:
+        tool_calls: list[dict[str, Any]] = []
+        for content in message.contents:
+            if content.type == "function_call":
+                arguments = content.arguments if isinstance(content.arguments, (str, Mapping)) else "{}"
+                if isinstance(arguments, Mapping):
+                    arguments = dict(arguments)
+                tool_calls.append(
+                    {
+                        "id": _sanitize_tool_call_id(content.call_id or ""),
+                        "type": "function",
+                        "function": {"name": content.name or "", "arguments": arguments},
+                    }
+                )
+        formatted: dict[str, Any] = {"role": "assistant", "content": message.text or None}
+        if tool_calls:
+            formatted["tool_calls"] = tool_calls
+        return formatted
+
+    def _format_tool_messages(self, message: Message) -> list[dict[str, Any]]:
+        tool_messages: list[dict[str, Any]] = []
+        for content in message.contents:
+            if content.type != "function_result":
+                continue
+            if content.items:
+                text_parts = [c.text or "" for c in content.items if c.type == "text"]
+                if any(c.type in ("data", "uri") for c in content.items):
+                    logger.warning(
+                        "Mistral does not support rich content (images, audio) in tool results. "
+                        "Rich content items will be omitted."
+                    )
+                result_text = "\n".join(text_parts)
+            else:
+                result_text = self._result_to_text(content.result)
+            tool_message: dict[str, Any] = {
+                "role": "tool",
+                "content": result_text,
+                "tool_call_id": _sanitize_tool_call_id(content.call_id or ""),
+            }
+            if name := getattr(content, "name", None):
+                tool_message["name"] = name
+            tool_messages.append(tool_message)
+        return tool_messages
+
     @staticmethod
-    def _is_json_schema_mapping(value: Mapping[str, Any]) -> bool:
-        """Return True when a mapping appears to be a JSON Schema rather than a response-format envelope."""
-        if not any(keyword in value for keyword in _JSON_SCHEMA_KEYWORDS):
-            return False
+    def _result_to_text(result: Any) -> str:
+        if result is None:
+            return ""
+        if isinstance(result, str):
+            return result
+        try:
+            return json.dumps(result)
+        except (TypeError, ValueError):
+            return str(result)
 
-        schema_type = value.get("type")
-        if schema_type is None:
-            return True
-        if isinstance(schema_type, str):
-            return schema_type in _JSON_SCHEMA_TYPES
-        if isinstance(schema_type, Sequence) and not isinstance(schema_type, (str, bytes)):
-            entries = cast("Sequence[object]", schema_type)
-            return all(isinstance(item, str) and item in _JSON_SCHEMA_TYPES for item in entries)
+    def _prepare_tools(self, tools: Sequence[Any] | None) -> list[Any] | None:
+        """Translate the framework tool list into Mistral API tool definitions.
 
-        return False
-
-    def _prepare_tools(self, options: Mapping[str, Any]) -> list[types.Tool] | None:
-        """Translate the framework tool list into Gemini API tool objects.
-
-        The Gemini API does not accept framework ``FunctionTool`` objects directly.
-        This method acts as the translation boundary between the two type systems.
-        It handles two kinds of entries in ``options["tools"]``:
-
-        - ``FunctionTool``: a framework abstraction for a callable with a name,
-          description, and JSON schema. Translated to ``types.FunctionDeclaration``
-          (Gemini's equivalent) and grouped into a single ``types.Tool``, which is
-          how the Gemini API expects function declarations to be passed.
-        - ``types.Tool``: already in Gemini's native format (e.g. built-in tools
-          such as search or code execution). Passed through unchanged. Use the
-          ``get_*_tool`` factory methods on this class to produce these.
-
-        Args:
-            options: Resolved chat options whose ``tools`` entry may contain
-                ``FunctionTool`` instances, plain callables, or ``types.Tool`` objects.
-
-        Returns:
-            A non-empty list of ``types.Tool`` objects ready for the Gemini API,
-            or ``None`` if no tools are configured.
+        ``FunctionTool`` instances are translated to Mistral function definitions; plain
+        mappings are passed through unchanged.
         """
-        tools_option: list[Any] = options.get("tools") or []
+        if not tools:
+            return None
+        prepared: list[Any] = []
+        for tool in tools:
+            if isinstance(tool, FunctionTool):
+                prepared.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description or "",
+                            "parameters": tool.parameters(),
+                        },
+                    }
+                )
+            else:
+                prepared.append(tool)
+        return prepared or None
 
-        result: list[types.Tool] = []
-
-        # Translate framework FunctionTool objects to Gemini API FunctionDeclaration objects
-        declarations = [
-            types.FunctionDeclaration(
-                name=tool.name,
-                description=tool.description or "",
-                parameters_json_schema=tool.parameters(),
-            )
-            for tool in tools_option
-            if isinstance(tool, FunctionTool)
-        ]
-        if declarations:
-            result.append(types.Tool(function_declarations=declarations))
-
-        # Objects of type types.Tool are already in Gemini's native format
-        result.extend(tool for tool in tools_option if isinstance(tool, types.Tool))
-
-        return result or None
-
-    @staticmethod
-    def _requires_server_side_tool_invocations(tools: Sequence[types.Tool]) -> bool:
-        """Return whether Gemini Developer API requires server-side tool invocation reporting."""
-        has_function_declarations = any(tool.function_declarations for tool in tools)
-        return has_function_declarations and any(RawGeminiChatClient._has_server_side_tool(tool) for tool in tools)
-
-    @staticmethod
-    def _has_server_side_tool(tool: types.Tool) -> bool:
-        """Return whether the Gemini tool declares a native server-side tool."""
-        return any(
-            field_name != "function_declarations" and getattr(tool, field_name, None) is not None
-            for field_name in type(tool).model_fields
-        )
-
-    def _prepare_tool_config(self, tool_choice: Any) -> types.ToolConfig | None:
-        """Build a Gemini ``ToolConfig`` from the framework ``tool_choice`` value.
-
-        Args:
-            tool_choice: Raw ``tool_choice`` value from options (string, dict, or None).
-
-        Returns:
-            A ``types.ToolConfig`` with the appropriate ``FunctionCallingConfig``, or None
-            if no ``tool_choice`` is set or the mode is unsupported.
-        """
+    def _prepare_tool_choice(self, tool_choice: Any) -> Any | None:
+        """Build the Mistral ``tool_choice`` value from the framework ``tool_choice`` option."""
         tool_mode = validate_tool_mode(tool_choice)
         if not tool_mode:
             return None
@@ -1028,245 +673,201 @@ class RawGeminiChatClient(
         match tool_mode.get("mode"):
             case "auto":
                 if "allowed_tools" in tool_mode:
-                    function_calling_mode = types.FunctionCallingConfigMode.VALIDATED
-                    allowed_names = list(tool_mode["allowed_tools"])
-                else:
-                    function_calling_mode, allowed_names = types.FunctionCallingConfigMode.AUTO, None
+                    logger.warning("Mistral does not support restricting auto tool choice to specific tools.")
+                return "auto"
             case "none":
-                function_calling_mode, allowed_names = types.FunctionCallingConfigMode.NONE, None
+                return "none"
             case "required":
-                function_calling_mode = types.FunctionCallingConfigMode.ANY
-                name = tool_mode.get("required_function_name")
-                if name:
-                    allowed_names = [name]
-                elif "allowed_tools" in tool_mode:
-                    allowed_names = list(tool_mode["allowed_tools"])
-                else:
-                    allowed_names = None
+                if name := tool_mode.get("required_function_name"):
+                    return {"type": "function", "function": {"name": name}}
+                return "required"
             case unknown_mode:
-                logger.warning("Unsupported tool_choice mode for Gemini: %s", unknown_mode)
+                logger.warning("Unsupported tool_choice mode for Mistral: %s", unknown_mode)
                 return None
 
-        function_calling_kwargs: dict[str, Any] = {"mode": function_calling_mode}
-        if allowed_names is not None:
-            function_calling_kwargs["allowed_function_names"] = allowed_names
+    def _prepare_response_format(self, response_format: Any) -> dict[str, Any] | None:
+        """Build a Mistral ``response_format`` object from the framework option.
 
-        return types.ToolConfig(function_calling_config=types.FunctionCallingConfig(**function_calling_kwargs))
+        Supports Pydantic model types, raw JSON schema mappings, response-format envelopes
+        (``{"type": "json_object"}`` / ``{"type": "json_schema", "json_schema": {...}}``),
+        and the string ``"json"``.
+        """
+        if response_format is None:
+            return None
+
+        if isinstance(response_format, type) and issubclass(response_format, BaseModel):
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_format.__name__,
+                    "schema": response_format.model_json_schema(),
+                    "strict": True,
+                },
+            }
+
+        if isinstance(response_format, str):
+            if response_format in ("json", "json_object"):
+                return {"type": "json_object"}
+            logger.warning("Unsupported response_format string for Mistral: %s", response_format)
+            return None
+
+        if isinstance(response_format, Mapping):
+            mapping: dict[str, Any] = dict(cast("Mapping[str, Any]", response_format))
+            format_type = mapping.get("type")
+            if format_type == "json_object":
+                return {"type": "json_object"}
+            if format_type == "json_schema":
+                json_schema: dict[str, Any] = dict(mapping.get("json_schema") or {})
+                prepared_schema: dict[str, Any] = {
+                    "name": json_schema.get("name", "response"),
+                    "schema": json_schema.get("schema") or json_schema.get("schema_definition") or {},
+                }
+                if (strict := json_schema.get("strict")) is not None:
+                    prepared_schema["strict"] = strict
+                return {"type": "json_schema", "json_schema": prepared_schema}
+            # A raw JSON schema mapping
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": str(mapping.get("title", "response")),
+                    "schema": mapping,
+                    "strict": True,
+                },
+            }
+
+        type_name = type(cast(object, response_format)).__name__
+        logger.warning("Unsupported response_format for Mistral: %s", type_name)
+        return None
 
     # endregion
 
     # region Response parsing
 
-    def _process_generate_response(
+    def _parse_response(
         self,
-        response: types.GenerateContentResponse,
+        response: Mapping[str, Any],
         *,
-        response_format: type[BaseModel] | None = None,
+        response_format: Any | None = None,
     ) -> ChatResponse:
-        """Convert a Gemini generate_content response to a framework ChatResponse.
-
-        Args:
-            response: The raw ``GenerateContentResponse`` from the Gemini API.
-            response_format: Optional Pydantic model type for structured output parsing.
-                When provided, the response text is parsed into the given model and
-                made available via ``ChatResponse.value``.
-
-        Returns:
-            A ``ChatResponse`` with parsed messages, usage details, finish reason, and model ID.
-        """
-        candidate = response.candidates[0] if response.candidates else None
-        parts: list[types.Part] = (candidate.content.parts or []) if candidate and candidate.content else []
-        contents = self._parse_parts(parts)
+        """Convert a Mistral chat-completion response payload to a framework ChatResponse."""
+        choices = cast("Sequence[Mapping[str, Any]]", response.get("choices") or ())
+        choice: Mapping[str, Any] = choices[0] if choices else {}
+        message: Mapping[str, Any] = choice.get("message") or {}
+        contents = self._parse_message_contents(message)
+        finish_reason: FinishReasonLiteral | None = None
+        if reason := choice.get("finish_reason"):
+            finish_reason = _FINISH_REASON_MAP.get(str(reason))
         return ChatResponse(
-            response_id=None,
-            messages=[Message(role="assistant", contents=contents, raw_representation=candidate)],
-            usage_details=self._parse_usage(response.usage_metadata),
-            model=response.model_version or self.model,
-            finish_reason=self._map_finish_reason(
-                candidate.finish_reason.name if candidate and candidate.finish_reason else None
-            ),
+            response_id=response.get("id"),
+            messages=[Message(role="assistant", contents=contents, raw_representation=choice or None)],
+            usage_details=self._parse_usage(response.get("usage")),
+            model=response.get("model") or self.model,
+            created_at=self._format_created_at(response.get("created")),
+            finish_reason=finish_reason,
             response_format=response_format,
             raw_representation=response,
         )
 
-    def _process_chunk(self, chunk: types.GenerateContentResponse) -> ChatResponseUpdate:
-        """Convert a single streaming chunk to a framework ChatResponseUpdate.
+    def _parse_chunk(self, chunk: Mapping[str, Any], tool_calls: _StreamedToolCalls) -> ChatResponseUpdate:
+        """Convert a Mistral streaming completion chunk to a framework ChatResponseUpdate.
 
-        Usage details are attached only to the final chunk, identified by a non-None finish reason.
-
-        Args:
-            chunk: A streaming ``GenerateContentResponse`` chunk from the Gemini API.
-
-        Returns:
-            A ``ChatResponseUpdate`` with parsed contents, finish reason, and model ID.
+        Tool-call fragments are folded into ``tool_calls`` keyed by (choice, index) and
+        emitted as complete calls when their choice finishes.
         """
-        candidate = chunk.candidates[0] if chunk.candidates else None
-        parts: list[types.Part] = (candidate.content.parts or []) if candidate and candidate.content else []
-        contents = self._parse_parts(parts)
-
-        finish_reason = self._map_finish_reason(
-            candidate.finish_reason.name if candidate and candidate.finish_reason else None
-        )
-
-        # Attach usage to the final chunk only (when finish_reason is set).
-        if finish_reason and (usage := self._parse_usage(chunk.usage_metadata)):
-            contents.append(Content.from_usage(usage_details=usage))
-
+        contents: list[Content] = []
+        finish_reason: FinishReasonLiteral | None = None
+        choices = cast("Sequence[Mapping[str, Any]]", chunk.get("choices") or ())
+        for choice in choices:
+            choice_index = index if isinstance(index := choice.get("index"), int) else 0
+            delta: Mapping[str, Any] = choice.get("delta") or {}
+            contents.extend(self._parse_content_chunks(delta))
+            for fragment in cast("Sequence[Mapping[str, Any]]", delta.get("tool_calls") or ()):
+                contents.extend(tool_calls.add(choice_index, fragment))
+            if reason := choice.get("finish_reason"):
+                contents.extend(tool_calls.flush_choice(choice_index))
+                if finish_reason is None:
+                    finish_reason = _FINISH_REASON_MAP.get(str(reason))
+        if usage := self._parse_usage(chunk.get("usage")):
+            contents.append(Content.from_usage(usage_details=usage, raw_representation=chunk))
         return ChatResponseUpdate(
             contents=contents,
-            model=chunk.model_version,
+            role="assistant",
+            response_id=chunk.get("id"),
+            model=chunk.get("model"),
+            created_at=self._format_created_at(chunk.get("created")),
             finish_reason=finish_reason,
             raw_representation=chunk,
         )
 
-    def _parse_parts(self, parts: Sequence[types.Part]) -> list[Content]:
-        """Convert Gemini response parts to framework Content objects.
-
-        Args:
-            parts: Sequence of ``types.Part`` objects from a Gemini response candidate.
-
-        Returns:
-            A list of framework ``Content`` objects (text_reasoning, text, function_call, or
-            function_result).
-        """
-        contents: list[Content] = []
-        for part in parts:
-            if part.thought:
-                if part.text:
-                    contents.append(Content.from_text_reasoning(text=part.text, raw_representation=part))
-                continue
-            if part.text is not None:
-                contents.append(Content.from_text(text=part.text, raw_representation=part))
-            elif part.tool_call is not None:
-                tool_call = part.tool_call
-                if tool_call.id:
-                    call_id = tool_call.id
-                else:
-                    call_id = self._generate_tool_call_id()
-                    logger.debug("tool_call missing id; generated fallback call_id=%r", call_id)
-                if isinstance(tool_call.tool_type, types.ToolType):
-                    tool_name = tool_call.tool_type.value
-                else:
-                    tool_name = str(tool_call.tool_type or "tool_call")
-                contents.append(
-                    Content.from_function_call(
-                        call_id=call_id,
-                        name=tool_name,
-                        arguments=tool_call.args or {},
-                        informational_only=True,
-                        raw_representation=part,
-                    )
-                )
-            elif part.tool_response is not None:
-                tool_response = part.tool_response
-                contents.append(
-                    Content.from_function_result(
-                        call_id=tool_response.id or self._generate_tool_call_id(),
-                        result=tool_response.response,
-                        raw_representation=part,
-                    )
-                )
-            elif part.function_call is not None:
-                function_call = part.function_call
-                if function_call.id:
-                    call_id = function_call.id
-                else:
-                    call_id = self._generate_tool_call_id()
-                    logger.debug("function_call missing id; generated fallback call_id=%r", call_id)
-                # Surface Gemini 3's thought_signature as reasoning content preceding the call so it
-                # survives when the call is later reconstructed without its raw Part.
-                if part.thought_signature is not None:
-                    contents.append(
-                        Content.from_text_reasoning(
-                            protected_data=base64.b64encode(part.thought_signature).decode("utf-8")
-                        )
-                    )
-                contents.append(
-                    Content.from_function_call(
-                        call_id=call_id,
-                        name=function_call.name or "",
-                        arguments=function_call.args or {},
-                        raw_representation=part,
-                    )
-                )
-            elif part.function_response is not None:
-                function_response = part.function_response
-                contents.append(
-                    Content.from_function_result(
-                        call_id=function_response.id or self._generate_tool_call_id(),
-                        result=function_response.response,
-                        raw_representation=part,
-                    )
-                )
-            elif part.executable_code is not None:
-                if part.executable_code.code:
-                    contents.append(Content.from_text(text=part.executable_code.code, raw_representation=part))
-            elif part.code_execution_result is not None:
-                if part.code_execution_result.output:
-                    contents.append(Content.from_text(text=part.code_execution_result.output, raw_representation=part))
-            else:
-                logger.debug("Skipping unsupported response part from Gemini")
+    def _parse_message_contents(self, message: Mapping[str, Any]) -> list[Content]:
+        contents = self._parse_content_chunks(message)
+        tool_calls = cast("Sequence[Mapping[str, Any]]", message.get("tool_calls") or ())
+        contents.extend(_function_call_content(tool_call) for tool_call in tool_calls)
         return contents
 
-    def _parse_usage(self, usage: types.GenerateContentResponseUsageMetadata | None) -> UsageDetails | None:
-        """Extract token usage counts from Gemini usage metadata.
+    def _parse_content_chunks(self, message: Mapping[str, Any]) -> list[Content]:
+        contents: list[Content] = []
+        content = message.get("content")
+        if isinstance(content, str):
+            if content:
+                contents.append(Content.from_text(text=content))
+        elif content:
+            for chunk in cast("Sequence[Mapping[str, Any]]", content):
+                chunk_type = chunk.get("type")
+                if chunk_type == "text":
+                    if text := chunk.get("text"):
+                        contents.append(Content.from_text(text=text, raw_representation=chunk))
+                elif chunk_type == "thinking":
+                    if reasoning := self._thinking_to_text(chunk):
+                        contents.append(Content.from_text_reasoning(text=reasoning, raw_representation=chunk))
+                else:
+                    logger.debug("Skipping unsupported response chunk from Mistral: %s", chunk_type)
+        return contents
 
-        Args:
-            usage: The ``GenerateContentResponseUsageMetadata`` from the API response, or None.
+    @staticmethod
+    def _format_created_at(created: Any) -> str | None:
+        if not isinstance(created, (int, float)):
+            return None
+        return datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
-        Returns:
-            A ``UsageDetails`` dict with available token counts, or None if no usage data is present.
-        """
+    @staticmethod
+    def _thinking_to_text(chunk: Mapping[str, Any]) -> str:
+        thinking = chunk.get("thinking")
+        if isinstance(thinking, str):
+            return thinking
+        if isinstance(thinking, Sequence):
+            return "".join(
+                part.get("text") or ""
+                for part in cast("Sequence[Mapping[str, Any]]", thinking)
+                if isinstance(part, Mapping)
+            )
+        return ""
+
+    def _parse_usage(self, usage: Mapping[str, Any] | None) -> UsageDetails | None:
         if not usage:
             return None
         details: UsageDetails = {}
-        if (v := usage.prompt_token_count) is not None:
-            details["input_token_count"] = v
-        if (v := usage.candidates_token_count) is not None:
-            details["output_token_count"] = v
-        if (v := usage.total_token_count) is not None:
-            details["total_token_count"] = v
-        if (v := usage.cached_content_token_count) is not None:
-            details["cache_read_input_token_count"] = v
-        if (v := usage.thoughts_token_count) is not None:
-            details["reasoning_output_token_count"] = v
+        if (value := usage.get("prompt_tokens")) is not None:
+            details["input_token_count"] = value
+        if (value := usage.get("completion_tokens")) is not None:
+            details["output_token_count"] = value
+        if (value := usage.get("total_tokens")) is not None:
+            details["total_token_count"] = value
         return details or None
-
-    def _map_finish_reason(self, reason: str | None) -> FinishReasonLiteral | None:
-        """Map a Gemini finish reason string to the framework's FinishReasonLiteral.
-
-        Args:
-            reason: The finish reason name from the Gemini API (e.g. ``"STOP"``), or None.
-
-        Returns:
-            The corresponding ``FinishReasonLiteral``, or None if the reason is absent or unmapped.
-        """
-        if not reason:
-            return None
-        return _FINISH_REASON_MAP.get(reason)
 
     # endregion
 
-    @staticmethod
-    def _generate_tool_call_id() -> str:
-        """Generate a unique fallback ID for tool calls that lack one.
 
-        Returns:
-            A unique string in the format ``tool-call-<uuid_hex>``.
-        """
-        return f"tool-call-{uuid4().hex}"
-
-
-class GeminiChatClient(
-    FunctionInvocationLayer[GeminiChatOptionsT],
-    ChatMiddlewareLayer[GeminiChatOptionsT],
-    ChatTelemetryLayer[GeminiChatOptionsT],
-    RawGeminiChatClient[GeminiChatOptionsT],
-    Generic[GeminiChatOptionsT],
+class MistralChatClient(
+    FunctionInvocationLayer[MistralChatOptionsT],
+    ChatMiddlewareLayer[MistralChatOptionsT],
+    ChatTelemetryLayer[MistralChatOptionsT],
+    RawMistralChatClient[MistralChatOptionsT],
+    Generic[MistralChatOptionsT],
 ):
-    """Gemini chat client for Gemini Developer API or Vertex AI with function invocation, middleware, and telemetry.
+    """Mistral AI chat client with function invocation, middleware, and telemetry support.
 
-    This is the recommended client for most use cases. It builds on ``RawGeminiChatClient``
+    This is the recommended client for most use cases. It builds on ``RawMistralChatClient``
     and adds:
 
     - **Function invocation**: automatically calls ``FunctionTool`` implementations and feeds
@@ -1274,56 +875,68 @@ class GeminiChatClient(
     - **Middleware**: a composable chain for cross-cutting concerns (logging, retries, etc.).
     - **Telemetry**: OpenTelemetry traces and metrics emitted for every request.
 
-    Use ``RawGeminiChatClient`` instead when you need full control over the request pipeline
+    Use ``RawMistralChatClient`` instead when you need full control over the request pipeline
     and want to opt out of one or more of these layers.
+
+    Examples:
+        .. code-block:: python
+
+            from agent_framework_mistral import MistralChatClient
+
+            # Using environment variables
+            # Set MISTRAL_API_KEY=your-key
+            # Set MISTRAL_CHAT_MODEL=mistral-large-latest
+            client = MistralChatClient()
+
+            # Or passing parameters directly
+            client = MistralChatClient(
+                model="mistral-large-latest",
+                api_key="your-api-key",
+            )
+
+            response = await client.get_response("Hello!")
+            print(response.text)
+            await client.close()
     """
 
     def __init__(
         self,
         *,
-        api_key: str | None = None,
         model: str | None = None,
-        vertexai: bool | None = None,
-        project: str | None = None,
-        location: str | None = None,
-        credentials: Credentials | None = None,
-        env_file_path: str | None = None,
-        env_file_encoding: str | None = None,
-        client: genai.Client | None = None,
+        api_key: str | SecretString | None = None,
+        server_url: str | None = None,
+        client: httpx.AsyncClient | None = None,
         additional_properties: dict[str, Any] | None = None,
         middleware: Sequence[ChatAndFunctionMiddlewareTypes] | None = None,
         function_invocation_configuration: FunctionInvocationConfiguration | None = None,
+        env_file_path: str | None = None,
+        env_file_encoding: str | None = None,
     ) -> None:
-        """Create a Gemini chat client.
+        """Create a Mistral AI chat client.
 
-        Args:
-            api_key: Gemini Developer API key. Falls back to environment settings, preferring
-                ``GOOGLE_API_KEY`` over ``GEMINI_API_KEY``.
-            model: Default model identifier. Falls back to environment settings, preferring
-                ``GOOGLE_MODEL`` over ``GEMINI_MODEL``.
-            vertexai: Whether to use Vertex AI endpoints. Falls back to ``GOOGLE_GENAI_USE_VERTEXAI``.
-            project: Google Cloud project ID for Vertex AI. Falls back to ``GOOGLE_CLOUD_PROJECT``.
-            location: Vertex AI location. Falls back to ``GOOGLE_CLOUD_LOCATION``.
-            credentials: Google Cloud credentials for Vertex AI. When omitted, the SDK can use
-                Application Default Credentials.
-            env_file_path: Path to a ``.env`` file for credential loading.
-            env_file_encoding: Encoding for the ``.env`` file.
-            client: Pre-built ``genai.Client`` instance. When provided, connector auth settings are not required.
-            additional_properties: Extra properties stored on the client instance.
+        Keyword Args:
+            model: The Mistral chat model to use (e.g. "mistral-large-latest").
+                Can also be set via environment variable ``MISTRAL_CHAT_MODEL``.
+            api_key: Mistral API key. Defaults to ``MISTRAL_API_KEY`` environment variable.
+            server_url: Optional server URL override. Defaults to ``MISTRAL_SERVER_URL``
+                environment variable, or the Mistral default.
+            client: Optional pre-configured ``httpx.AsyncClient``. When provided, api_key is
+                not required and the client is expected to carry its own auth headers and
+                base URL.
+            additional_properties: Additional properties stored on the client instance.
             middleware: Optional middleware chain applied to every call.
             function_invocation_configuration: Optional configuration for the function invocation loop.
+            env_file_path: Path to ``.env`` file for settings.
+            env_file_encoding: Encoding for ``.env`` file.
         """
         super().__init__(
-            api_key=api_key,
             model=model,
-            vertexai=vertexai,
-            project=project,
-            location=location,
-            credentials=credentials,
-            env_file_path=env_file_path,
-            env_file_encoding=env_file_encoding,
+            api_key=api_key,
+            server_url=server_url,
             client=client,
             additional_properties=additional_properties,
             middleware=middleware,
             function_invocation_configuration=function_invocation_configuration,
+            env_file_path=env_file_path,
+            env_file_encoding=env_file_encoding,
         )

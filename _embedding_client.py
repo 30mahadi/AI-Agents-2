@@ -4,26 +4,30 @@ from __future__ import annotations
 
 import logging
 import sys
-from collections.abc import Sequence
-from contextlib import suppress
-from typing import Any, ClassVar, Generic, TypedDict
+import warnings
+from collections.abc import Mapping, Sequence
+from typing import Any, ClassVar, Generic, TypedDict, cast
 
+import httpx
 from agent_framework import (
     BaseEmbeddingClient,
-    Content,
     Embedding,
     EmbeddingGenerationOptions,
     GeneratedEmbeddings,
     UsageDetails,
     load_settings,
 )
-from agent_framework._telemetry import IS_TELEMETRY_ENABLED, get_user_agent, mark_feature_used
+from agent_framework._settings import SecretString
+from agent_framework._telemetry import get_user_agent, mark_feature_used
+from agent_framework.exceptions import (
+    IntegrationException,
+    IntegrationInvalidAuthException,
+    IntegrationInvalidRequestException,
+    IntegrationInvalidResponseException,
+)
 from agent_framework.observability import EmbeddingTelemetryLayer
-from azure.ai.inference.aio import EmbeddingsClient, ImageEmbeddingsClient
-from azure.ai.inference.models import ImageEmbeddingInput
-from azure.core.credentials import AzureKeyCredential
 
-from ._feature_usage import FeatureIndex, create_feature_usage_policy
+from ._feature_usage import FeatureIndex
 
 if sys.version_info >= (3, 13):
     from typing import TypeVar  # pragma: no cover
@@ -31,374 +35,360 @@ else:
     from typing_extensions import TypeVar  # pragma: no cover
 
 
-logger = logging.getLogger("agent_framework.foundry")
+logger = logging.getLogger("agent_framework.mistral")
 
-_IMAGE_MEDIA_PREFIXES = ("image/",)
+_MISTRAL_API_BASE_URL = "https://api.mistral.ai"
+_EMBEDDINGS_PATH = "/v1/embeddings"
+_DEFAULT_TIMEOUT_SECONDS = 60.0
 
 
-class FoundryEmbeddingOptions(EmbeddingGenerationOptions, total=False):
-    """Foundry inference-specific embedding options.
+def _resolve_injected_clients(
+    http_client: httpx.AsyncClient | None,
+    client: Any | None,
+) -> tuple[httpx.AsyncClient | None, Any | None]:
+    """Split the deprecated ``client`` parameter into REST and legacy-SDK forms.
 
-    Extends ``EmbeddingGenerationOptions`` with Foundry inference-specific fields.
+    Returns ``(http_client, sdk_client)``; at most one is set. The SDK form is
+    duck-typed on ``.embeddings`` so the ``mistralai`` dependency stays optional.
+    """
+    if client is None:
+        return http_client, None
+    warnings.warn(
+        "The 'client' parameter is deprecated; pass an httpx.AsyncClient as 'http_client' instead. "
+        "Support for injected mistralai.Mistral clients will be removed in the next major release.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    if http_client is not None:
+        raise ValueError("Provide either 'http_client' or the deprecated 'client' parameter, not both.")
+    if isinstance(client, httpx.AsyncClient):
+        return client, None
+    if hasattr(client, "embeddings"):
+        return None, client
+    raise TypeError(
+        "The 'client' parameter accepts an httpx.AsyncClient or a mistralai.Mistral instance; "
+        f"got {type(client).__name__}."
+    )
+
+
+class MistralEmbeddingOptions(EmbeddingGenerationOptions, total=False):
+    """Mistral AI-specific embedding options.
+
+    Extends EmbeddingGenerationOptions with Mistral-specific fields.
 
     Examples:
         .. code-block:: python
 
-            from agent_framework_foundry import FoundryEmbeddingOptions
+            from agent_framework_mistral import MistralEmbeddingOptions
 
-            options: FoundryEmbeddingOptions = {
-                "model": "text-embedding-3-small",
-                "dimensions": 1536,
-                "input_type": "document",
-                "encoding_format": "float",
+            options: MistralEmbeddingOptions = {
+                "model": "mistral-embed",
+                "dimensions": 1024,
             }
     """
 
-    input_type: str
-    """Input type hint for the model. Common values: ``"text"``, ``"query"``, ``"document"``."""
 
-    image_model: str
-    """Override model for image embeddings. Falls back to the client's ``image_model``."""
-
-    encoding_format: str
-    """Output encoding format.
-
-    Common values: ``"float"``, ``"base64"``, ``"int8"``, ``"uint8"``,
-    ``"binary"``, ``"ubinary"``.
-    """
-
-    extra_parameters: dict[str, Any]
-    """Additional model-specific parameters passed directly to the API."""
-
-
-FoundryEmbeddingOptionsT = TypeVar(
-    "FoundryEmbeddingOptionsT",
+MistralEmbeddingOptionsT = TypeVar(
+    "MistralEmbeddingOptionsT",
     bound=TypedDict,  # type: ignore[valid-type]
-    default="FoundryEmbeddingOptions",
+    default="MistralEmbeddingOptions",
     covariant=True,
 )
 
 
-class FoundryEmbeddingSettings(TypedDict, total=False):
-    """Foundry inference embedding settings."""
+class MistralEmbeddingSettings(TypedDict, total=False):
+    """Mistral AI embedding settings.
 
-    models_endpoint: str | None
-    models_api_key: str | None
+    Fields:
+        api_key: Mistral API key. Resolved from ``MISTRAL_API_KEY``.
+        embedding_model: Embedding model name. Resolved from ``MISTRAL_EMBEDDING_MODEL``.
+        server_url: Optional server URL override. Resolved from ``MISTRAL_SERVER_URL``.
+    """
+
+    api_key: str | None
     embedding_model: str | None
-    image_embedding_model: str | None
+    server_url: str | None
 
 
-class RawFoundryEmbeddingClient(
-    BaseEmbeddingClient[Content | str, list[float], FoundryEmbeddingOptionsT],
-    Generic[FoundryEmbeddingOptionsT],
+class RawMistralEmbeddingClient(
+    BaseEmbeddingClient[str, list[float], MistralEmbeddingOptionsT],
+    Generic[MistralEmbeddingOptionsT],
 ):
-    """Raw Foundry embedding client without telemetry.
+    """Raw Mistral AI embedding client without telemetry.
 
-    Accepts both text (``str``) and image (``Content``) inputs. Text and image
-    inputs within a single batch are separated and dispatched to
-    ``EmbeddingsClient`` and ``ImageEmbeddingsClient`` respectively. Results
-    are reassembled in the original input order.
+    Talks to the Mistral REST API directly over HTTP; the ``mistralai`` SDK is not required.
 
     Keyword Args:
-        model: The text embedding model (e.g. "text-embedding-3-small").
-            Can also be set via environment variable FOUNDRY_EMBEDDING_MODEL.
-        image_model: The image embedding model (e.g. "Cohere-embed-v3-english").
-            Can also be set via environment variable FOUNDRY_IMAGE_EMBEDDING_MODEL.
-            Falls back to ``model`` if not provided.
-        endpoint: The Foundry inference endpoint URL.
-            Can also be set via environment variable FOUNDRY_MODELS_ENDPOINT.
-        api_key: API key for authentication.
-            Can also be set via environment variable FOUNDRY_MODELS_API_KEY.
-        text_client: Optional pre-configured ``EmbeddingsClient``.
-        image_client: Optional pre-configured ``ImageEmbeddingsClient``.
-        credential: Optional ``AzureKeyCredential`` or token credential. If not provided,
-            one is created from ``api_key``.
-        env_file_path: Path to .env file for settings.
-        env_file_encoding: Encoding for .env file.
+        model: The Mistral embedding model (e.g. "mistral-embed").
+            Can also be set via environment variable ``MISTRAL_EMBEDDING_MODEL``.
+        api_key: Mistral API key. Defaults to ``MISTRAL_API_KEY`` environment variable.
+        server_url: Optional server URL override. Defaults to ``MISTRAL_SERVER_URL``
+            environment variable, or the Mistral default.
+        http_client: Optional pre-configured ``httpx.AsyncClient``. When provided, api_key is
+            not required and the client is expected to carry its own auth headers and base URL.
+        client: Deprecated. Accepts an ``httpx.AsyncClient`` (treated as ``http_client``) or a
+            ``mistralai.Mistral`` instance, which keeps working through the legacy SDK path
+            until the next major release.
+        additional_properties: Additional properties stored on the client instance.
+        env_file_path: Path to ``.env`` file for settings.
+        env_file_encoding: Encoding for ``.env`` file.
     """
+
+    INJECTABLE: ClassVar[set[str]] = {"http_client", "client"}
 
     def __init__(
         self,
         *,
         model: str | None = None,
-        image_model: str | None = None,
-        endpoint: str | None = None,
-        api_key: str | None = None,
-        text_client: EmbeddingsClient | None = None,
-        image_client: ImageEmbeddingsClient | None = None,
-        credential: AzureKeyCredential | None = None,
+        api_key: str | SecretString | None = None,
+        server_url: str | None = None,
+        http_client: httpx.AsyncClient | None = None,
+        client: Any | None = None,
         additional_properties: dict[str, Any] | None = None,
         env_file_path: str | None = None,
         env_file_encoding: str | None = None,
     ) -> None:
-        """Initialize a raw Foundry embedding client."""
-        settings = load_settings(
-            FoundryEmbeddingSettings,
-            env_prefix="FOUNDRY_",
-            required_fields=["models_endpoint", "embedding_model"],
-            models_endpoint=endpoint,
-            models_api_key=api_key,
+        """Initialize a raw Mistral AI embedding client."""
+        http_client, sdk_client = _resolve_injected_clients(http_client, client)
+        injected = http_client is not None or sdk_client is not None
+        required_fields = ["embedding_model"] if injected else ["embedding_model", "api_key"]
+        mistral_settings = load_settings(
+            MistralEmbeddingSettings,
+            env_prefix="MISTRAL_",
+            required_fields=required_fields,
+            api_key=str(api_key) if isinstance(api_key, SecretString) else api_key,
             embedding_model=model,
-            image_embedding_model=image_model,
+            server_url=server_url,
             env_file_path=env_file_path,
             env_file_encoding=env_file_encoding,
         )
 
-        self.model = settings["embedding_model"]  # type: ignore[reportTypedDictNotRequiredAccess]
-        self.image_model: str = settings.get("image_embedding_model") or self.model  # type: ignore[assignment]
-        resolved_endpoint = settings["models_endpoint"]  # type: ignore[reportTypedDictNotRequiredAccess]
+        self.model: str = mistral_settings["embedding_model"]  # type: ignore[assignment]
+        self.server_url = mistral_settings.get("server_url")
+        self._owns_client = not injected
+        self._sdk_client = sdk_client
+        self.client: Any
 
-        if credential is None and settings.get("models_api_key"):
-            credential = AzureKeyCredential(settings["models_api_key"])  # type: ignore[arg-type]
+        if sdk_client is not None:
+            self.client = sdk_client
+        elif http_client is not None:
+            self.client = http_client
+            if self.server_url is None:
+                client_base_url = str(http_client.base_url).rstrip("/")
+                self.server_url = client_base_url or None
+        else:
+            resolved_api_key: str = mistral_settings["api_key"]  # type: ignore[assignment]
+            self.client = httpx.AsyncClient(
+                base_url=self.server_url or _MISTRAL_API_BASE_URL,
+                headers={
+                    "Authorization": f"Bearer {resolved_api_key}",
+                    "User-Agent": get_user_agent(),
+                    "Accept": "application/json",
+                },
+                timeout=_DEFAULT_TIMEOUT_SECONDS,
+            )
 
-        if credential is None and text_client is None and image_client is None:
-            raise ValueError("Either 'api_key', 'credential', or pre-configured client(s) must be provided.")
-
-        client_kwargs: dict[str, Any] = {
-            "endpoint": resolved_endpoint,
-            "credential": credential,
-        }
-        if IS_TELEMETRY_ENABLED:
-            client_kwargs["user_agent"] = get_user_agent()
-        self._text_client = text_client or EmbeddingsClient(
-            **client_kwargs,
-            per_retry_policies=[create_feature_usage_policy()],
-        )
-        self._image_client = image_client or ImageEmbeddingsClient(
-            **client_kwargs,
-            per_retry_policies=[create_feature_usage_policy()],
-        )
-        self._endpoint = resolved_endpoint
         super().__init__(additional_properties=additional_properties)
 
     async def close(self) -> None:
-        """Close the underlying SDK clients and release resources."""
-        with suppress(Exception):
-            await self._text_client.close()
-        with suppress(Exception):
-            await self._image_client.close()
-
-    async def __aenter__(self) -> RawFoundryEmbeddingClient[FoundryEmbeddingOptionsT]:
-        """Enter the async context manager."""
-        return self
-
-    async def __aexit__(self, *args: Any) -> None:
-        """Exit the async context manager and close clients."""
-        await self.close()
+        """Close the internally created HTTP client."""
+        if self._owns_client:
+            await self.client.aclose()
 
     def service_url(self) -> str:
         """Get the URL of the service."""
-        return self._endpoint or ""
+        return self.server_url or _MISTRAL_API_BASE_URL
 
     async def get_embeddings(
         self,
-        values: Sequence[Content | str],
+        values: Sequence[str],
         *,
-        options: FoundryEmbeddingOptionsT | None = None,
-    ) -> GeneratedEmbeddings[list[float], FoundryEmbeddingOptionsT]:
-        """Generate embeddings for text and/or image inputs.
-
-        Text inputs (``str`` or ``Content`` with ``type="text"``) are sent to the
-        text embeddings endpoint. Image inputs (``Content`` with an image
-        ``media_type``) are sent to the image embeddings endpoint. Results are
-        returned in the same order as the input.
+        options: MistralEmbeddingOptionsT | None = None,
+    ) -> GeneratedEmbeddings[list[float], MistralEmbeddingOptionsT]:
+        """Call the Mistral AI embeddings API.
 
         Args:
-            values: A sequence of text strings or ``Content`` instances.
+            values: The text values to generate embeddings for.
             options: Optional embedding generation options.
 
         Returns:
             Generated embeddings with usage metadata.
 
         Raises:
-            ValueError: If model is not provided or an unsupported content type is encountered.
+            ValueError: If model is not provided or values is empty.
+            IntegrationInvalidAuthException: If Mistral rejects the configured credentials.
+            IntegrationInvalidRequestException: If Mistral rejects the request.
+            IntegrationInvalidResponseException: If Mistral returns an invalid response.
+            IntegrationException: If the request fails for another reason.
         """
         if not values:
             return GeneratedEmbeddings([], options=options)
-        mark_feature_used(FeatureIndex.FOUNDRY_EMBEDDING)
 
-        opts: dict[str, Any] = dict(options) if options else {}
+        opts: dict[str, Any] = options or {}  # type: ignore
+        model = opts.get("model") or self.model
+        if not model:
+            raise ValueError("model is required")
 
-        # Separate text and image inputs, tracking original indices.
-        text_items: list[tuple[int, str]] = []
-        image_items: list[tuple[int, ImageEmbeddingInput]] = []
+        mark_feature_used(FeatureIndex.MISTRAL)
+        if self._sdk_client is not None:
+            return await self._get_embeddings_sdk(self._sdk_client, model, values, opts, options)
 
-        for idx, value in enumerate(values):
-            if isinstance(value, str):
-                text_items.append((idx, value))
-            elif isinstance(value, Content):
-                if value.type == "text" and value.text is not None:
-                    text_items.append((idx, value.text))
-                elif (
-                    value.type in ("data", "uri")
-                    and value.media_type
-                    and value.media_type.startswith(_IMAGE_MEDIA_PREFIXES[0])
-                ):
-                    if not value.uri:
-                        raise ValueError(f"Image Content at index {idx} has no URI.")
-                    image_input = ImageEmbeddingInput(image=value.uri, text=value.text)
-                    image_items.append((idx, image_input))
-                else:
-                    raise ValueError(
-                        f"Unsupported Content type '{value.type}' with media_type "
-                        f"'{value.media_type}' at index {idx}. Expected text content or "
-                        f"image content (media_type starting with 'image/')."
+        request: dict[str, Any] = {"model": model, "input": list(values)}
+        if "dimensions" in opts:
+            request["output_dimension"] = opts["dimensions"]
+
+        try:
+            response = await self.client.post(_EMBEDDINGS_PATH, json=request)
+            if response.status_code >= 400:
+                message = (
+                    f"Mistral embeddings request failed with status {response.status_code}: {response.text[:2000]}"
+                )
+                if response.status_code in (401, 403):
+                    raise IntegrationInvalidAuthException(message)
+                if response.status_code < 500:
+                    raise IntegrationInvalidRequestException(message)
+                raise IntegrationException(message)
+        except IntegrationException:
+            raise
+        except Exception as ex:
+            raise IntegrationException(f"Mistral embeddings request failed: {ex}", inner_exception=ex) from ex
+
+        try:
+            raw_payload = response.json()
+            if not isinstance(raw_payload, Mapping):
+                raise IntegrationInvalidResponseException("Mistral embeddings response must be a JSON object.")
+            payload = cast("Mapping[str, Any]", raw_payload)
+            embeddings: list[Embedding[list[float]]] = []
+            data = cast("Sequence[Mapping[str, Any]]", payload.get("data") or ())
+            items = sorted(data, key=lambda item: item.get("index") or 0)
+            for item in items:
+                vector = [float(v) for v in cast("Sequence[float]", item.get("embedding") or ())]
+                embeddings.append(
+                    Embedding(
+                        vector=vector,
+                        dimensions=len(vector),
+                        model=payload.get("model") or model,
                     )
-            else:
-                raise ValueError(f"Unsupported input type {type(value).__name__} at index {idx}.")
-
-        # Build shared API kwargs (without model, which differs per client).
-        common_kwargs: dict[str, Any] = {}
-        if dimensions := opts.get("dimensions"):
-            common_kwargs["dimensions"] = dimensions
-        if encoding_format := opts.get("encoding_format"):
-            common_kwargs["encoding_format"] = encoding_format
-        if input_type := opts.get("input_type"):
-            common_kwargs["input_type"] = input_type
-        if extra_parameters := opts.get("extra_parameters"):
-            common_kwargs["model_extras"] = extra_parameters
-
-        # Allocate results array.
-        embeddings: list[Embedding[list[float]] | None] = [None] * len(values)
-        usage_details: UsageDetails = {}
-
-        # Embed text inputs.
-        if text_items:
-            if not (text_model := opts.get("model") or self.model):
-                raise ValueError("A model is required, either in the client or options, for text inputs.")
-            text_inputs = [t for _, t in text_items]
-            response = await self._text_client.embed(
-                input=text_inputs,
-                model=text_model,
-                **common_kwargs,
-            )
-            for i, item in enumerate(response.data):
-                original_idx = text_items[i][0]
-                vector: list[float] = [float(v) for v in item.embedding]
-                embeddings[original_idx] = Embedding(
-                    vector=vector,
-                    dimensions=len(vector),
-                    model=response.model or text_model,
-                )
-            if response.usage:
-                usage_details["input_token_count"] = (usage_details.get("input_token_count") or 0) + (
-                    response.usage.prompt_tokens or 0
-                )
-                usage_details["output_token_count"] = (usage_details.get("output_token_count") or 0) + (
-                    getattr(response.usage, "completion_tokens", 0) or 0
                 )
 
-        # Embed image inputs.
-        if image_items:
-            if not (image_model := opts.get("image_model") or self.image_model):
-                raise ValueError("An image_model is required, either in the client or options, for image inputs.")
-            image_inputs = [img for _, img in image_items]
-            response = await self._image_client.embed(
-                input=image_inputs,
-                model=image_model,
-                **common_kwargs,
-            )
-            for i, item in enumerate(response.data):
-                original_idx = image_items[i][0]
-                image_vector: list[float] = [float(v) for v in item.embedding]
-                embeddings[original_idx] = Embedding(
-                    vector=image_vector,
-                    dimensions=len(image_vector),
-                    model=response.model or image_model,
+            usage_dict: UsageDetails | None = None
+            if usage := payload.get("usage"):
+                usage_dict = {}
+                if (value := usage.get("prompt_tokens")) is not None:
+                    usage_dict["input_token_count"] = value
+                if (value := usage.get("total_tokens")) is not None:
+                    usage_dict["total_token_count"] = value
+
+            return GeneratedEmbeddings(embeddings, options=options, usage=usage_dict or None)
+        except IntegrationException:
+            raise
+        except Exception as ex:
+            raise IntegrationInvalidResponseException(
+                f"Mistral embeddings response was invalid: {ex}",
+                inner_exception=ex,
+            ) from ex
+
+    async def _get_embeddings_sdk(
+        self,
+        sdk_client: Any,
+        model: str,
+        values: Sequence[str],
+        opts: Mapping[str, Any],
+        options: MistralEmbeddingOptionsT | None,
+    ) -> GeneratedEmbeddings[list[float], MistralEmbeddingOptionsT]:
+        """Legacy path for injected mistralai.Mistral clients; removed in the next major release."""
+        kwargs: dict[str, Any] = {"model": model, "inputs": list(values)}
+        if "dimensions" in opts:
+            kwargs["output_dimension"] = opts["dimensions"]
+
+        response = await sdk_client.embeddings.create_async(**kwargs)
+
+        embeddings: list[Embedding[list[float]]] = []
+        if response and response.data:
+            items = sorted(response.data, key=lambda d: d.index if d.index is not None else 0)
+            for item in items:
+                vector = list(item.embedding) if item.embedding else []
+                embeddings.append(
+                    Embedding(
+                        vector=vector,
+                        dimensions=len(vector),
+                        model=response.model or model,
+                    )
                 )
-            if response.usage:
-                usage_details["input_token_count"] = (usage_details.get("input_token_count") or 0) + (
-                    response.usage.prompt_tokens or 0
-                )
-                usage_details["output_token_count"] = (usage_details.get("output_token_count") or 0) + (
-                    getattr(response.usage, "completion_tokens", 0) or 0
-                )
-        return GeneratedEmbeddings(
-            [embedding for embedding in embeddings if embedding is not None],
-            options=options,
-            usage=usage_details,
-        )
+
+        usage_dict: UsageDetails | None = None
+        if response and response.usage:
+            usage_dict = {
+                "input_token_count": response.usage.prompt_tokens,
+                "total_token_count": response.usage.total_tokens,
+            }
+
+        return GeneratedEmbeddings(embeddings, options=options, usage=usage_dict)
 
 
-class FoundryEmbeddingClient(
-    EmbeddingTelemetryLayer[Content | str, list[float], FoundryEmbeddingOptionsT],
-    RawFoundryEmbeddingClient[FoundryEmbeddingOptionsT],
-    Generic[FoundryEmbeddingOptionsT],
+class MistralEmbeddingClient(
+    EmbeddingTelemetryLayer[str, list[float], MistralEmbeddingOptionsT],
+    RawMistralEmbeddingClient[MistralEmbeddingOptionsT],
+    Generic[MistralEmbeddingOptionsT],
 ):
-    """Foundry embedding client with telemetry support.
-
-    Supports both text and image inputs in a single client. Pass plain strings
-    or ``Content`` instances created with ``Content.from_text()`` or
-    ``Content.from_data()``.
+    """Mistral AI embedding client with telemetry support.
 
     Keyword Args:
-        model: The text embedding model (e.g. "text-embedding-3-small").
-            Can also be set via environment variable FOUNDRY_EMBEDDING_MODEL.
-        image_model: The image embedding model
-            (e.g. "Cohere-embed-v3-english"). Can also be set via environment variable
-            FOUNDRY_IMAGE_EMBEDDING_MODEL. Falls back to ``model``.
-        endpoint: The Foundry inference endpoint URL.
-            Can also be set via environment variable FOUNDRY_MODELS_ENDPOINT.
-        api_key: API key for authentication.
-            Can also be set via environment variable FOUNDRY_MODELS_API_KEY.
-        text_client: Optional pre-configured ``EmbeddingsClient``.
-        image_client: Optional pre-configured ``ImageEmbeddingsClient``.
-        credential: Optional ``AzureKeyCredential`` or token credential.
-        otel_provider_name: Override for the OpenTelemetry provider name.
-        env_file_path: Path to .env file for settings.
-        env_file_encoding: Encoding for .env file.
+        model: The Mistral embedding model (e.g. "mistral-embed").
+            Can also be set via environment variable ``MISTRAL_EMBEDDING_MODEL``.
+        api_key: Mistral API key. Defaults to ``MISTRAL_API_KEY`` environment variable.
+        server_url: Optional server URL override. Defaults to ``MISTRAL_SERVER_URL``
+            environment variable, or the Mistral default.
+        http_client: Optional pre-configured ``httpx.AsyncClient``.
+        client: Deprecated. Accepts an ``httpx.AsyncClient`` or a ``mistralai.Mistral`` instance.
+        otel_provider_name: Optional telemetry provider name override.
+        env_file_path: Path to ``.env`` file for settings.
+        env_file_encoding: Encoding for ``.env`` file.
 
     Examples:
         .. code-block:: python
 
-            from agent_framework_foundry import FoundryEmbeddingClient
+            from agent_framework_mistral import MistralEmbeddingClient
 
             # Using environment variables
-            # Set FOUNDRY_MODELS_ENDPOINT=https://your-endpoint.inference.ai.azure.com
-            # Set FOUNDRY_MODELS_API_KEY=your-key
-            # Set FOUNDRY_EMBEDDING_MODEL=text-embedding-3-small
-            # Set FOUNDRY_IMAGE_EMBEDDING_MODEL=Cohere-embed-v3-english
-            client = FoundryEmbeddingClient()
+            # Set MISTRAL_API_KEY=your-key
+            # Set MISTRAL_EMBEDDING_MODEL=mistral-embed
+            client = MistralEmbeddingClient()
 
-            # Text embeddings
+            # Or passing parameters directly
+            client = MistralEmbeddingClient(
+                model="mistral-embed",
+                api_key="your-api-key",
+            )
+
+            # Generate embeddings
             result = await client.get_embeddings(["Hello, world!"])
-
-            # Image embeddings
-            from agent_framework import Content
-
-            image = Content.from_data(data=image_bytes, media_type="image/png")
-            result = await client.get_embeddings([image])
-
-            # Mixed text and image
-            result = await client.get_embeddings(["hello", image])
+            print(result[0].vector)
+            await client.close()
     """
 
-    OTEL_PROVIDER_NAME: ClassVar[str] = "azure.ai.inference"
+    OTEL_PROVIDER_NAME: ClassVar[str] = "mistralai"
 
     def __init__(
         self,
         *,
         model: str | None = None,
-        image_model: str | None = None,
-        endpoint: str | None = None,
-        api_key: str | None = None,
-        text_client: EmbeddingsClient | None = None,
-        image_client: ImageEmbeddingsClient | None = None,
-        credential: AzureKeyCredential | None = None,
+        api_key: str | SecretString | None = None,
+        server_url: str | None = None,
+        http_client: httpx.AsyncClient | None = None,
+        client: Any | None = None,
         otel_provider_name: str | None = None,
         additional_properties: dict[str, Any] | None = None,
         env_file_path: str | None = None,
         env_file_encoding: str | None = None,
     ) -> None:
-        """Initialize a Foundry embedding client."""
+        """Initialize a Mistral AI embedding client."""
         super().__init__(
             model=model,
-            image_model=image_model,
-            endpoint=endpoint,
             api_key=api_key,
-            text_client=text_client,
-            image_client=image_client,
-            credential=credential,
+            server_url=server_url,
+            http_client=http_client,
+            client=client,
             additional_properties=additional_properties,
             otel_provider_name=otel_provider_name,
             env_file_path=env_file_path,
