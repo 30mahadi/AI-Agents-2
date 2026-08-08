@@ -1,51 +1,94 @@
-# DevUI File Search Agent
+# Harness Console
 
-Interactive web UI for uploading and chatting with documents, images, audio, and video using Azure Content Understanding + OpenAI file_search RAG.
+A Textual-based terminal UI for running and observing AI agents built with the Agent Framework.
 
-## How It Works
+## Quick Start
 
-1. **Upload** any supported file (PDF, image, audio, video) via the DevUI chat
-2. **CU analyzes** the file — auto-selects the right analyzer per media type
-3. **Markdown extracted** by CU is uploaded to an OpenAI vector store
-4. **file_search** tool is registered — LLM retrieves top-k relevant chunks
-5. **Ask questions** across all uploaded documents with token-efficient RAG
+```python
+from console import run_agent_async, build_default_observers
 
-## Setup
+await run_agent_async(
+    agent=my_agent,
+    session=my_session,
+    observers=build_default_observers(),
+)
+```
 
-1. Set environment variables (or create a `.env` file in `python/`):
-   ```bash
-   FOUNDRY_PROJECT_ENDPOINT=https://your-project.services.ai.azure.com/
-   AZURE_OPENAI_RESPONSES_DEPLOYMENT_NAME=gpt-4.1
-   AZURE_CONTENTUNDERSTANDING_ENDPOINT=https://your-cu-resource.services.ai.azure.com/
-   ```
+See [`harness_research.py`](../harness_research.py) for a complete example.
 
-2. Log in with Azure CLI:
-   ```bash
-   az login
-   ```
+## Package Structure
 
-3. Run with DevUI:
-   ```bash
-   devui samples/02-agents/devui/agent_content_understanding_file_search_azure_openai
-   ```
+```
+console/
+├── __init__.py              # Public API exports
+├── harness_console.py       # run_agent_async() entry point
+├── app.py                   # HarnessApp (Textual application)
+├── app_state.py             # HarnessAppState, enums, data types
+├── agent_runner.py          # HarnessAgentRunner (streaming orchestration)
+├── state_driver.py          # IUXStateDriver protocol
+├── textual_state_driver.py  # Textual implementation of IUXStateDriver
+├── formatters.py            # Tool call formatters
+├── observers/               # Lifecycle observers
+│   ├── base.py              #   ConsoleObserver abstract base
+│   ├── text_output.py       #   Streaming text display
+│   ├── tool_call_display.py #   Tool call formatting
+│   ├── tool_approval.py     #   User approval for tool calls
+│   ├── error_display.py     #   Error messages
+│   ├── usage_display.py     #   Token usage tracking
+│   └── reasoning_display.py #   Reasoning/thinking blocks
+├── components/              # Textual UI widgets
+│   ├── scroll_panel.py      #   Conversation history
+│   ├── text_input.py        #   User text input
+│   ├── list_selection.py    #   Multiple choice selector
+│   ├── agent_status.py      #   Spinner + usage display
+│   └── agent_mode_help.py   #   Mode indicator + help text
+└── commands/                # Slash command handlers
+    ├── base.py              #   CommandHandler abstract base
+    ├── exit_handler.py      #   /exit
+    ├── mode_handler.py      #   /mode [plan|execute]
+    ├── todo_handler.py      #   /todos
+    └── session_handler.py   #   /session-export, /session-import
+```
 
-4. Open the DevUI URL in your browser and start uploading files.
+## Public API
 
-## Supported File Types
+| Export | Description |
+|--------|-------------|
+| `run_agent_async` | Main entry point — runs the Textual app with an agent |
+| `build_default_observers` | Factory for the standard observer set |
+| `build_default_command_handlers` | Factory for slash command handlers |
+| `ConsoleObserver` | Base class for custom observers |
+| `ToolCallFormatter` | Base class for custom tool formatters |
+| `CommandHandler` | Base class for custom slash commands |
 
-| Type | Formats | CU Analyzer (auto-detected) |
-|------|---------|----------------------------|
-| Documents | PDF, DOCX, XLSX, PPTX, HTML, TXT, Markdown | `prebuilt-documentSearch` |
-| Images | JPEG, PNG, TIFF, BMP | `prebuilt-documentSearch` |
-| Audio | WAV, MP3, FLAC, OGG, M4A | `prebuilt-audioSearch` |
-| Video | MP4, MOV, AVI, WebM | `prebuilt-videoSearch` |
+## Architecture
 
-## Comparison with the multimodal agent
+The console follows a unidirectional data flow:
 
-| Feature | multimodal_agent | file_search_agent |
-|---------|-----------------|-------------------|
-| CU extraction | ✅ Full content injected | ✅ Content indexed in vector store |
-| RAG | ❌ | ✅ file_search retrieves top-k chunks |
-| Large docs (100+ pages) | ⚠️ May exceed context window | ✅ Token-efficient |
-| Multiple large files | ⚠️ Context overflow risk | ✅ All indexed, searchable |
-| Best for | Small docs, quick inspection | Large docs, multi-file Q&A |
+```
+AgentRunner → Observers → StateDriver → AppState → Textual UI
+                                ↑
+                          User Input (app.py)
+```
+
+- **AgentRunner** streams responses from the agent and dispatches events to observers.
+- **Observers** process events (text chunks, tool calls, errors) and update the state driver.
+- **StateDriver** (`IUXStateDriver`) mutates `HarnessAppState` and notifies the UI.
+- **Textual App** reads state and syncs widgets on each notification.
+
+### Key Design Choices
+
+| Concern | Approach |
+|---------|----------|
+| Rendering | Textual widgets + Rich markup (no manual ANSI) |
+| State | Single `HarnessAppState` dataclass, mutated by driver |
+| Streaming text | Truncate-and-rewrite on RichLog for flicker-free updates |
+| Extensibility | Custom observers, formatters, and commands via base classes |
+| Follow-up questions | Observer returns `FollowUpQuestion` → UI shows prompt/choices |
+
+## Dependencies
+
+- `textual` — TUI framework
+- `rich` — Text formatting
+- `agent-framework` — Core agent framework
+

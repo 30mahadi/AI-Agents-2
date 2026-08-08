@@ -1,191 +1,274 @@
-# Agent Framework Lab - Lightning
+# Declarative Agent Samples
 
-**Agent Framework Lab Lightning** is a specialized package that integrates [Microsoft Agent Framework](https://github.com/microsoft/agent-framework) with [Agent-lightning](https://github.com/microsoft/agent-lightning) to provide reinforcement learning (RL) training capabilities for AI agents.
-
-This package enables you to train and fine-tune agents using advanced RL algorithms from VERL (e.g., GRPO, PPO, Reinforce++) with support for distributed training, multi-GPU setups, and comprehensive monitoring. It also supports complex multi-turn agent interactions during training and optimization techniques like prompt optimization. See the [Agent-lightning documentation](https://microsoft.github.io/agent-lightning/stable/) for details.
-
-> **Note**: This module is part of the consolidated `agent-framework-lab` package. Install the package with the `lightning` extra to use this module.
+This folder contains sample code demonstrating how to use the **Microsoft Agent Framework Declarative** package to create agents from YAML specifications. The declarative approach allows you to define your agents in a structured, configuration-driven way, separating agent behavior from implementation details.
 
 ## Installation
 
-Install the `agent-framework-lab` package with Lightning dependencies:
+Install the declarative package via pip:
 
 ```bash
-pip install "agent-framework-lab[lightning]"
+pip install agent-framework-declarative
 ```
 
-### Optional Dependencies
+> **Note:** These samples use `AgentFactory` (declarative agents), which is **experimental** and emits an `ExperimentalWarning` on first use. The declarative *workflows* surface is stable.
 
-```bash
-# For math-related training
-pip install -e ".[lightning,math]"
+## What is Declarative Agent Framework?
 
-# For tau2 benchmarking
-pip install -e ".[lightning,tau2]"
-```
+The declarative package provides support for building agents based on YAML specifications. This approach offers several benefits:
 
-To prepare for RL training, you'll also need to install dependencies like PyTorch, Ray, and vLLM. See the [Agent-lightning setup instructions](https://microsoft.github.io/agent-lightning/stable/tutorials/installation/) for more details.
+- **Cross-Platform Compatibility**: Write one YAML definition and create agents in both Python and .NET - the same agent configuration works across both platforms
+- **Separation of Concerns**: Define agent behavior in YAML files separate from your implementation code
+- **Reusability**: Share and version agent configurations independently across projects and languages
+- **Flexibility**: Easily swap between different LLM providers and configurations
+- **Maintainability**: Update agent instructions and settings without modifying code
 
-## Usage Patterns
+## Samples in This Folder
 
-The basic usage pattern follows these steps:
+### 1. **Get Weather Agent** ([`get_weather_agent.py`](./get_weather_agent.py))
 
-1. **Prepare your dataset** as a list of samples (typically dictionaries)
-2. **Create an agent function** that processes samples and returns evaluation scores
-3. **Decorate with `@agentlightning.rollout`** to enable training
-4. **Configure and run training** with the `agentlightning.Trainer` class
+Demonstrates how to create an agent with custom function tools using the declarative approach.
 
-### Example Implementation
+- Uses Azure OpenAI Responses client
+- Shows how to bind Python functions to the agent using the `bindings` parameter
+- Loads agent configuration from `declarative-agents/agent-samples/chatclient/GetWeather.yaml`
+- Implements a simple weather lookup function tool
+
+**Key concepts**: Function binding, Azure OpenAI integration, tool usage
+
+### 2. **Microsoft Learn Agent** ([`microsoft_learn_agent.py`](./microsoft_learn_agent.py))
+
+Shows how to create an agent that can search and retrieve information from Microsoft Learn documentation using the Model Context Protocol (MCP).
+
+- Uses Microsoft Foundry client with MCP server integration
+- Demonstrates async context managers for proper resource cleanup
+- Loads agent configuration from `declarative-agents/agent-samples/foundry/MicrosoftLearnAgent.yaml`
+- Uses Azure CLI credentials for authentication
+- Leverages MCP to access Microsoft documentation tools
+
+**Requirements**: `pip install agent-framework-foundry`
+
+**Key concepts**: Microsoft Foundry integration, MCP server usage, async patterns, resource management
+
+### 3. **Inline YAML Agent** ([`inline_yaml.py`](./inline_yaml.py))
+
+Shows how to create an agent using an inline YAML string rather than a file.
+
+- Uses Microsoft Foundry v2 Client with instructions.
+
+**Requirements**: `pip install agent-framework-foundry`
+
+**Key concepts**: Inline YAML definition.
+
+### 4. **Azure OpenAI Responses Agent** ([`azure_openai_responses_agent.py`](./azure_openai_responses_agent.py))
+
+Illustrates a basic agent using Azure OpenAI with structured responses.
+
+- Uses Azure OpenAI Responses client
+- Shows how to pass credentials via `client_kwargs`
+- Loads agent configuration from `declarative-agents/agent-samples/azure/AzureOpenAIResponses.yaml`
+- Demonstrates accessing structured response data
+
+**Key concepts**: Azure OpenAI integration, credential management, structured outputs
+
+### 5. **OpenAI Responses Agent** ([`openai_agent.py`](./openai_agent.py))
+
+Demonstrates the simplest possible agent using OpenAI directly.
+
+- Uses OpenAI API (requires `OPENAI_API_KEY` environment variable)
+- Shows minimal configuration needed for basic agent creation
+- Loads agent configuration from `declarative-agents/agent-samples/openai/OpenAIResponses.yaml`
+
+**Key concepts**: OpenAI integration, minimal setup, environment-based configuration
+
+## Agent Samples Repository
+
+All the YAML configuration files referenced in these samples are located in the [`declarative-agents/agent-samples`](../../../../declarative-agents/agent-samples/) folder at the repository root. This folder contains declarative agent specifications organized by provider:
+
+- **`declarative-agents/agent-samples/azure/`** - Azure OpenAI agent configurations
+- **`declarative-agents/agent-samples/chatclient/`** - Chat client agent configurations with tools
+- **`declarative-agents/agent-samples/foundry/`** - Microsoft Foundry agent configurations
+- **`declarative-agents/agent-samples/openai/`** - OpenAI agent configurations
+
+**Important**: These YAML files are **platform-agnostic** and work with both Python and .NET implementations of the Agent Framework. You can use the exact same YAML definition to create agents in either language, making it easy to share agent configurations across different technology stacks.
+
+These YAML files define:
+- Agent instructions and system prompts
+- Model selection and parameters
+- Tool and function configurations
+- Provider-specific settings
+- MCP server integrations (where applicable)
+
+## Common Patterns
+
+### Creating an Agent from YAML String
 
 ```python
-from agent_framework.lab.lightning import AgentFrameworkTracer
-from agentlightning import rollout, Trainer, LLM, Dataset
-from agentlightning.algorithm.verl import VERL
+from agent_framework.declarative import AgentFactory
 
-TaskType = Any
+with open("agent.yaml", "r") as f:
+    yaml_str = f.read()
 
-@rollout
-async def math_agent(task: TaskType, llm: LLM) -> float:
-    """A function that solves a math problem and returns the evaluation score."""
-    async with (
-        MCPStdioTool(name="calculator", command="uvx", args=["mcp-server-calculator"]) as mcp_server,
-        Agent(
-            client=OpenAIChatClient(
-                model=llm.model,
-                api_key="your-api-key",
-                base_url=llm.endpoint,
-            ),
-            name="MathAgent",
-            instructions="Solve the math problem and output answer after ###",
-            temperature=llm.sampling_parameters.get("temperature", 0.0),
-        ) as agent,
-    ):
-        result = await agent.run(task["question"], tools=mcp_server)
-        # Your evaluation logic here...
-        return evaluation_score
-
-# Training configuration
-config = {
-    "data": {"train_batch_size": 8},
-    "trainer": {"total_epochs": 2, "n_gpus_per_node": 1},
-    # ... additional config
-}
-
-# Initialize agent-framework tracer to send telemetry data to agent-lightning's observability backend
-tracer = AgentFrameworkTracer()
-
-trainer = Trainer(algorithm=VERL(config), tracer=tracer, n_workers=2)
-# Both train_dataset and val_dataset are lists of TaskType
-trainer.fit(math_agent, train_dataset, val_data=val_dataset)
+agent = AgentFactory().create_agent_from_yaml(yaml_str)
+# response = await agent.run("Your query here")
 ```
 
-## Example 1: Training a Math Agent
+### Creating an Agent from YAML Path
 
-This example trains an agent that uses an MCP calculator tool to solve math problems. The dataset is a small subset from the [Calc-X](https://huggingface.co/datasets/MU-NLPC/Calc-X) dataset. The Agent-lightning team has also experimented with a similar agent using a larger dataset. See [this example](https://github.com/microsoft/agent-lightning/tree/a63197355cc23b5b235c49fe7c20b54f9d4ebcd2/examples/calc_x) for more details.
+```python
+from pathlib import Path
+from agent_framework.declarative import AgentFactory
 
-Running this example requires a minimum of 40GB GPU memory. If you don't have enough GPU memory, you can use a smaller model like `Qwen2.5-0.5B-Instruct`, though the results won't be as good. To run the example:
+yaml_path = Path("agent.yaml")
+agent = AgentFactory().create_agent_from_yaml_path(yaml_path)
+# response = await agent.run("Your query here")
+```
+
+### Binding Custom Functions
+
+```python
+from pathlib import Path
+from agent_framework.declarative import AgentFactory
+
+def my_function(param: str) -> str:
+    return f"Result: {param}"
+
+agent_factory = AgentFactory(bindings={"my_function": my_function})
+agent = agent_factory.create_agent_from_yaml_path(Path("agent_with_tool.yaml"))
+```
+
+### Using Credentials
+
+```python
+from pathlib import Path
+from agent_framework.declarative import AgentFactory
+from azure.identity import AzureCliCredential
+
+agent = AgentFactory(
+    client_kwargs={"credential": AzureCliCredential()}
+).create_agent_from_yaml_path(Path("azure_agent.yaml"))
+```
+
+### Adding Custom Provider Mappings
+
+```python
+from pathlib import Path
+from agent_framework.declarative import AgentFactory
+# from my_custom_module import MyCustomChatClient
+
+# Register a custom provider mapping
+agent_factory = AgentFactory(
+    additional_mappings={
+        "MyProvider": {
+            "package": "my_custom_module",
+            "name": "MyCustomChatClient",
+            "model_field": "model",
+        }
+    }
+)
+
+# Now you can reference "MyProvider" in your YAML
+# Example YAML snippet:
+# model:
+#   provider: MyProvider
+#   id: my-model-name
+
+agent = agent_factory.create_agent_from_yaml_path(Path("custom_provider.yaml"))
+```
+
+This allows you to extend the declarative framework with custom chat client implementations. The mapping requires:
+- **package**: The Python package/module to import from
+- **name**: The class name of your SupportsChatGetResponse implementation
+- **model_field**: The constructor parameter name that accepts the value of the `model.id` field from the YAML
+
+You can reference your custom provider using either `Provider.ApiType` format or just `Provider` in your YAML configuration, as long as it matches the registered mapping.
+
+### Using PowerFx Formulas in YAML
+
+The declarative framework supports PowerFx formulas in YAML values, enabling dynamic configuration based on environment variables and conditional logic. Prefix any value with `=` to evaluate it as a PowerFx expression.
+
+#### Environment Variable Lookup
+
+Access environment variables using the `Env.<variable_name>` syntax:
+
+```yaml
+model:
+  connection:
+    kind: key
+    apiKey: =Env.OPENAI_API_KEY
+    endpoint: =Env.BASE_URL & "/v1"  # String concatenation with &
+
+  options:
+    temperature: 0.7
+    maxOutputTokens: =Env.MAX_TOKENS  # Will be converted to appropriate type
+```
+
+#### Conditional Logic
+
+Use PowerFx operators for conditional configuration. This is particularly useful for adjusting parameters based on which model is being used:
+
+```yaml
+model:
+  id: =Env.MODEL_NAME
+  options:
+    # Set max tokens based on model - using conditional logic
+    maxOutputTokens: =If(Env.MODEL_NAME = "gpt-5", 8000, 4000)
+
+    # Adjust temperature for different environments
+    temperature: =If(Env.ENVIRONMENT = "production", 0.3, 0.7)
+
+    # Use logical operators for complex conditions
+    seed: =If(Env.ENVIRONMENT = "production" And Env.DETERMINISTIC = "true", 42, Blank())
+```
+
+#### Supported PowerFx Features
+
+- **String operations**: Concatenation (`&`), comparison (`=`, `<>`), substring testing (`in`, `exactin`)
+- **Logical operators**: `And`, `Or`, `Not` (also `&&`, `||`, `!`)
+- **Arithmetic**: Basic math operations (`+`, `-`, `*`, `/`)
+- **Conditional**: `If(condition, true_value, false_value)`
+- **Environment access**: `Env.<VARIABLE_NAME>`
+
+Example with multiple features:
+
+```yaml
+instructions: =If(
+  Env.USE_EXPERT_MODE = "true",
+  "You are an expert AI assistant with advanced capabilities. " & Env.CUSTOM_INSTRUCTIONS,
+  "You are a helpful AI assistant."
+)
+
+model:
+  options:
+    stopSequences: =If("gpt-4" in Env.MODEL_NAME, ["END", "STOP"], ["END"])
+```
+
+**Note**: PowerFx evaluation happens when the YAML is loaded, not at runtime. Use environment variables (via `.env` file or `env_file` parameter) to make configurations flexible across environments.
+
+## Running the Samples
+
+Each sample can be run independently. Make sure you have the required environment variables set:
+
+- For Azure samples: Ensure you're logged in via Azure CLI (`az login`)
+- For OpenAI samples: Set `OPENAI_API_KEY` environment variable
 
 ```bash
-cd samples
-# Run the ray cluster (see the troubleshooting section for more details)
-ray start --head --dashboard-host=0.0.0.0
-# Run the training script
-python train_math_agent.py
+# Run a specific sample
+python get_weather_agent.py
+python microsoft_learn_agent.py
+python inline_yaml.py
+python azure_openai_responses_agent.py
+python openai_responses_agent.py
 ```
 
-To debug the agent used in the example, you can run the script with the `--debug` flag:
+## Learn More
 
-```bash
-python train_math_agent.py --debug
-```
+- [Agent Framework Declarative Package](../../../packages/declarative/) - Main declarative package documentation
+- [Agent Samples](../../../../declarative-agents/agent-samples/) - Additional declarative agent YAML specifications
+- [Agent Framework Core](../../../packages/core/) - Core agent framework documentation
 
-The training curve below shows results with Qwen2.5-1.5B-Instruct and GRPO. Validation accuracy increases from 10% to 35% in the first 8 steps, then begins to overfit.
+## Next Steps
 
-![Training Curve](./assets/train_math_agent.png)
-
-## Example 2: Training a Tau2 Agent
-
-This advanced example demonstrates training on complex multi-agent scenarios using the Tau2 benchmark. It features a multi-agent setup with an assistant agent and a user simulator agent, training the assistant while keeping the user simulator fixed. The example incorporates a multi-step workflow with tool usage and complex evaluation metrics. Currently, training uses the airline domain with a 50/50 split between training and validation data.
-
-Before running this example, please read the [agent-lightning-lab-tau2](../tau2/README.md) documentation and follow the setup instructions.
-
-To run the example:
-
-```bash
-# Set required environment variables
-export TAU2_DATA_DIR="/path/to/tau2/data"
-
-# Used for user simulator and LLM judge
-export OPENAI_BASE_URL="your-endpoint"
-export OPENAI_API_KEY="your-key"
-
-# Used for tracking on Weights & Biases
-export WANDB_API_KEY="your-key"
-
-# Run the ray cluster
-ray start --head --dashboard-host=0.0.0.0
-
-# Train the tau2 agent
-cd samples
-python samples/train_tau2_agent.py
-
-# Debug mode
-python samples/train_tau2_agent.py --debug
-```
-
-This example uses more advanced Agent-lightning features compared to the math example. It's based on the `LitAgent` class rather than the `@rollout` decorator and involves concepts like resources and agent filtering. We recommend reading the [Agent-lightning documentation](https://microsoft.github.io/agent-lightning/stable/) to learn more.
-
-Results with Qwen2.5-1.5B-Instruct and GRPO are shown below. Validation accuracy improves from 28% to 40% over 8 epochs.
-
-![Training Curve](./assets/train_tau2_agent.png)
-
-## Troubleshooting
-
-### Ray Connection Issues
-
-Agent-lightning uses VERL for RL training, which depends on Ray. To avoid issues, it's recommended to start Ray manually beforehand. If you encounter Ray startup problems:
-
-```bash
-# Stop existing Ray processes
-ray stop
-
-# Start Ray with debugging enabled
-env RAY_DEBUG=legacy HYDRA_FULL_ERROR=1 VLLM_USE_V1=1 ray start --head --dashboard-host=0.0.0.0
-```
-
-**Important**: Run Ray commands in the same directory as your training script. Set any required environment variables (`WANDB_API_KEY`, `HF_TOKEN`) before starting Ray.
-
-### GPU Memory Issues
-
-1. **Reduce `gpu_memory_utilization`** to <0.8
-2. **Enable FSDP offloading**:
-   ```python
-   "fsdp_config": {
-       "param_offload": True,
-       "optimizer_offload": True,
-   }
-   ```
-3. **Decrease batch sizes**:
-   - `train_batch_size`
-   - `ppo_mini_batch_size`
-   - `log_prob_micro_batch_size_per_gpu`
-
-### Agent Debugging
-
-Always test your agent before training:
-
-```bash
-# Use debug mode to validate agent behavior
-python your_training_script.py --debug
-
-# Check agent responses and evaluation logic
-# Ensure proper tool integration and result extraction
-```
-
-## Contributing
-
-This package is part of the Microsoft Agent Framework Lab. Please see the main repository for contribution guidelines.
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+1. Explore the YAML files in the `declarative-agents/agent-samples` folder to understand the configuration format
+2. Try modifying the samples to use different models or instructions
+3. Create your own declarative agent configurations
+4. Build custom function tools and bind them to your agents

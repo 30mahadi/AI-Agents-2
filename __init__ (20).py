@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Spam detection workflow sample for DevUI testing."""
+"""Sequential Agents Workflow - Writer → Reviewer."""
 
 from .workflow import workflow  # ty: ignore[unresolved-import]  # pyrefly: ignore
 

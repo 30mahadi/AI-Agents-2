@@ -1,211 +1,185 @@
-# DevUI Samples
+# Build your own claw and agent harness — Python samples
 
-This folder contains sample agents and workflows designed to work with the Agent Framework DevUI - a lightweight web interface for running and testing agents interactively.
+Runnable Python samples for the [**"Build your own claw and agent harness with Microsoft Agent Framework"** blog](https://devblogs.microsoft.com/agent-framework/build-your-own-claw-and-agent-harness-with-microsoft-agent-framework)
+series. Each step builds a personal finance / investing assistant on top of
+`create_harness_agent`, reusing the shared harness `console` package in the parent `harness/`
+directory.
 
-## What is DevUI?
+- **Part 1 — `claw_step01_meet_your_claw.py`** — the minimal harness.
+- **Part 2 — `claw_step02_working_with_data.py`** — file access, approvals, and durable memory.
+- **Part 3 — `claw_step03_scaling_capabilities.py`** — skills, shell, CodeAct, and background agents.
 
-DevUI is a sample application that provides:
+## Prerequisites
 
-- A web interface for testing agents and workflows
-- OpenAI-compatible API endpoints
-- Directory-based entity discovery
-- In-memory entity registration
-- Sample entity gallery
+1. A Microsoft Foundry project with a deployed model.
+2. Azure CLI installed and authenticated (`az login`).
 
-> **Note**: DevUI is a sample app for development and testing. For production use, build your own custom interface using the Agent Framework SDK.
-
-## Quick Start
-
-### Option 1: In-Memory Mode (Programmatic Registration)
-
-Run a single sample directly. This demonstrates how to register agents and workflows in code without using DevUI's directory discovery.
-
-This sample uses Microsoft Foundry. Before running it:
-
-1. Copy `.env.example` in this folder to `.env`, or export the same values in your shell
-2. Set `FOUNDRY_PROJECT_ENDPOINT` and `FOUNDRY_MODEL`
-3. Run `az login`
-
-Then start the sample:
+## Environment variables
 
 ```bash
-cd python/samples/02-agents/devui
-python in_memory_mode.py
+export FOUNDRY_PROJECT_ENDPOINT="https://your-project.services.ai.azure.com/api/projects/your-project"
+export FOUNDRY_MODEL="your-model-deployment-name"
 ```
 
-This opens your browser at http://localhost:8090 with two Foundry-backed agents and a simple text transformation workflow.
+---
 
-### Option 2: Directory Discovery with Shared Root `.env`
+## Part 1 — Meet your claw
 
-Run the folder-level launcher to load `samples/02-agents/devui/.env` and then start DevUI with directory discovery for this folder:
+Builds the foundation of the assistant on top of `create_harness_agent`.
+
+### What this sample demonstrates
+
+- **`create_harness_agent`** — a factory that builds a batteries-included agent: function
+  invocation, per-service-call history persistence, planning (`TodoProvider` +
+  `AgentModeProvider`), and web search.
+- **A custom function tool** — `get_stock_price`, exposing local data to the agent. Prices are
+  illustrative mock data, not real quotes.
+- **Web search** — provided automatically by the harness for market news and commentary.
+- **Planning & modes** — the agent breaks a multi-step request ("review my watchlist") into a todo
+  list and switches between *plan* and *execute* modes.
+- **Shared harness console** — interactive streaming UI (reused from the parent `harness/console`
+  package) with `/todos`, `/mode`, and `/exit` commands.
+
+### Running
 
 ```bash
-cd python/samples/02-agents/devui
-python main.py
+# From the repository root, using a PEP 723 compatible runner:
+uv run python/samples/02-agents/harness/build_your_own_claw/claw_step01_meet_your_claw.py
 ```
 
-This starts the server at http://localhost:8080 with all discoverable agents and workflows available. The root `.env` acts as shared fallback configuration for discovered samples.
+### What to expect
 
-### Option 3: Directory Discovery with the `devui` CLI
+The sample starts an interactive loop. Try these in order:
 
-If you prefer the CLI directly, you can still launch DevUI from this folder:
+1. `/mode execute` — switch out of the default plan mode; quick lookups don't need a plan.
+2. `What's the price of MSFT?` — the agent calls the `get_stock_price` tool.
+3. `Any recent news on NVDA?` — the agent uses web search.
+4. `Add MSFT, NVDA and SPY to my watch list` — saved to `watchlist.md` in the session's memory.
+5. `/mode plan` — switch back to plan mode for a bigger, multi-step task.
+6. `Review my watchlist and recommend some stocks to add` — the agent plans, then executes. Type
+   `/todos` to see the list and `/mode` to inspect the current mode.
+
+---
+
+## Part 2 — Working with your data, safely
+
+Teaches the assistant to work with *your* data safely.
+
+### What this sample demonstrates
+
+- **File access** — the agent reads a pre-populated `working/portfolio.csv` and writes reports
+  with the `file_access_*` tools. File access is opt-in; the sample enables it by pointing its
+  store at the sample's `working/` folder via `create_harness_agent(file_access_store=...)`.
+- **Approvals** — file-access tools require approval by default, but the sample wires the built-in
+  `read_only_tools_auto_approval_rule` so reads/lists/searches are frictionless while saving and
+  deleting still pause for approval. The `place_trade` tool is marked
+  `approval_mode="always_require"`, so the harness asks you to approve or deny before any trade
+  runs. The trade is simulated.
+
+  > ⚠️ **Security — avoid tool-name collisions:** `read_only_tools_auto_approval_rule`
+  > approves local file-access tools by tool name only (`file_access_read`,
+  > `file_access_ls`, `file_access_grep`). Auto-approval rules may match by name,
+  > so any other local tool registered under one of these names — for example a
+  > tool with a caller-configurable name such as the shell tool — may also be
+  > auto-approved, bypassing the human approval boundary. Ensure no other tool
+  > collides with these reserved names.
+- **Durable memory, two ways:**
+  - **File memory** (coarse-grained, explicit) — the agent reads/writes files such as
+    `watchlist.md`. File memory is on by default; its files live on disk under
+    `{cwd}/agent-file-memory/<session-id>/`, so they persist across runs on this machine. A new
+    session starts empty; use `/session-export` and `/session-import` to preserve the session id so a
+    relaunch re-links to its memory files (no fixed folder or owner id required).
+  - **Foundry memory** (fine-grained, automatic) — Microsoft Foundry extracts durable facts from
+    the conversation. Opt-in; see below.
+
+### Additional environment variables (optional — enable Foundry memory)
 
 ```bash
-cd python/samples/02-agents/devui
-devui .
+export FOUNDRY_MEMORY_STORE="claw-finance-memory"
+export FOUNDRY_EMBEDDING_MODEL="text-embedding-3-small"
 ```
 
-DevUI discovery checks for a sample-specific `.env` first and then falls back to `.env` in `samples/02-agents/devui/`.
+When these are not set, the sample runs with file memory only and prints a note.
 
-## Sample Structure
-
-DevUI discovers samples from Python packages that export either `agent` or `workflow`.
-
-Typical agent layout:
-
-```
-agent_name/
-├── __init__.py      # Must export: agent = ...
-├── agent.py         # Agent implementation
-└── .env.example     # Optional example environment variables
-```
-
-Typical workflow layout:
-
-```
-workflow_name/
-├── __init__.py      # Must export: workflow = ...
-├── workflow.py      # Workflow implementation
-├── workflow.yaml    # Optional declarative definition
-└── .env.example     # Optional example environment variables
-```
-
-## Available Samples
-
-### Agents
-
-| Sample | What it demonstrates | Required keys / auth |
-| ------ | -------------------- | -------------------- |
-| [**agent_weather/**](agent_weather/) | A richer Foundry-backed weather agent that shows chat middleware, function middleware, tool calling, and an approval-required tool alongside auto-approved tools. | `FOUNDRY_PROJECT_ENDPOINT`, `FOUNDRY_MODEL`, plus Azure CLI auth via `az login` |
-| [**agent_foundry/**](agent_foundry/) | A minimal Foundry-backed weather agent with current weather and forecast tools. Use this when you want the smallest possible directory-discovered agent sample. | `FOUNDRY_PROJECT_ENDPOINT`, `FOUNDRY_MODEL`, plus Azure CLI auth via `az login` |
-| [**agent_content_understanding/**](agent_content_understanding/) | Upload and analyze documents, images, audio, and video with Azure Content Understanding. | `FOUNDRY_PROJECT_ENDPOINT`, `FOUNDRY_MODEL`, `AZURE_CONTENTUNDERSTANDING_ENDPOINT`, plus Azure CLI auth via `az login` |
-| [**agent_content_understanding_file_search_azure_openai/**](agent_content_understanding_file_search_azure_openai/) | Combine Azure Content Understanding extraction with Azure OpenAI vector-store file search. | `FOUNDRY_PROJECT_ENDPOINT`, `FOUNDRY_MODEL`, `AZURE_CONTENTUNDERSTANDING_ENDPOINT`, plus Azure CLI auth via `az login` |
-| [**agent_content_understanding_file_search_foundry/**](agent_content_understanding_file_search_foundry/) | Combine Azure Content Understanding extraction with Foundry vector-store file search. | `FOUNDRY_PROJECT_ENDPOINT`, `FOUNDRY_MODEL`, `AZURE_CONTENTUNDERSTANDING_ENDPOINT`, plus Azure CLI auth via `az login` |
-
-### Workflows
-
-| Sample | What it demonstrates | Required keys / auth |
-| ------ | -------------------- | -------------------- |
-| [**workflow_declarative/**](workflow_declarative/) | A YAML-defined workflow loaded through `WorkflowFactory`, with nested age-based branching and no model client code. | None |
-| [**workflow_with_agents/**](workflow_with_agents/) | A content review workflow that uses agents as executors and routes based on structured review output (`Writer -> Reviewer -> Editor/Publisher -> Summarizer`). | `AZURE_OPENAI_ENDPOINT`, plus `AZURE_OPENAI_CHAT_MODEL` or `AZURE_OPENAI_MODEL`; Azure CLI auth via `az login`; `AZURE_OPENAI_API_VERSION` is optional |
-| [**workflow_spam/**](workflow_spam/) | A multi-step spam detection workflow with human-in-the-loop approval, branching for spam vs. legitimate messages, and a final reporting step. | None |
-| [**workflow_fanout/**](workflow_fanout/) | A larger fan-out/fan-in data processing workflow with parallel validation, multiple transformations, QA, aggregation, and demo failure toggles. | None |
-
-### Standalone Examples
-
-| Sample | What it demonstrates | Required keys / auth |
-| ------ | -------------------- | -------------------- |
-| [**in_memory_mode.py**](in_memory_mode.py) | Registers multiple entities directly in Python: two Foundry-backed agents plus a simple workflow, all served from one file without directory discovery. | `FOUNDRY_PROJECT_ENDPOINT`, `FOUNDRY_MODEL`, plus Azure CLI auth via `az login` |
-
-## Environment Variables
-
-For samples that require external services:
-
-1. Copy `.env.example` to `.env`
-2. Fill in the required values
-3. Run `az login` for samples that use Azure CLI authentication
-
-Directory discovery checks `.env` files in this order:
-
-1. The entity directory itself, for example `agent_weather/.env`
-2. The root DevUI samples folder, `samples/02-agents/devui/.env`
-
-That means the root `.env.example` can hold shared defaults for multiple samples, while a sample-specific `.env` can override those values when needed.
-
-`in_memory_mode.py` and `main.py` both load `.env` from `samples/02-agents/devui/`, so the root `.env.example` in this folder is the right starting point for both commands.
-
-Alternatively, set environment variables globally:
+### Running
 
 ```bash
-# Foundry-backed samples
-export FOUNDRY_PROJECT_ENDPOINT="https://your-project.services.ai.azure.com"
-export FOUNDRY_MODEL="gpt-4o"
-
-# Azure OpenAI workflow_with_agents sample
-export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com"
-export AZURE_OPENAI_CHAT_MODEL="gpt-4o"
-export AZURE_OPENAI_MODEL="gpt-4o"
-
-az login
+uv run python/samples/02-agents/harness/build_your_own_claw/claw_step02_working_with_data.py
 ```
 
-## Using DevUI with Your Own Agents
+### What to expect
 
-To make your agent discoverable by DevUI:
+Try these in order (the sample starts in **execute** mode — quick lookups don't need a plan):
 
-1. Create a folder for your agent
-2. Add an `__init__.py` that exports `agent` or `workflow`
-3. (Optional) Add a `.env` file for environment variables
+1. `What's in my portfolio?` — the agent reads `portfolio.csv` with the file_access tools.
+2. `Write me a short report on my portfolio and save it.` — the agent writes a Markdown file under
+   `working/`; saving is a write, so **you are prompted to approve** before the file is created.
+3. `I'm a conservative investor saving for a house in two years.` — a durable fact (recalled later
+   by Foundry memory when enabled).
+4. `Buy 10 shares of MSFT.` — the agent calls `place_trade`; **you are prompted to approve or
+   deny** before it runs.
+5. `Add SPY to my watchlist.` — saved to `watchlist.md` in file memory.
 
-Example:
+Foundry memory (when enabled) recalls facts about you in any new session. File memory (the
+watchlist) lives on disk keyed by session id, so `/session-export` before you quit and
+`/session-import` after relaunching to re-link the relaunched session to its files, then ask
+*"What's on my watchlist?"* or *"What do you know about me?"*.
 
-```python
-# my_agent/__init__.py
-from agent_framework import Agent
-from agent_framework.openai import OpenAIChatClient
+## Part 3 — Scaling its capabilities
 
-agent = Agent(
-    name="MyAgent",
-    description="My custom agent",
-    client=OpenAIChatClient(),
-    # ... your configuration
-)
-```
+Makes the assistant *more capable* along four axes.
 
-Then run:
+### What this sample demonstrates
+
+- **Skills** — finance know-how (`valuation`, `risk-scoring`) is packaged as discoverable
+  `SKILL.md` files under `skills/`, which the agent loads on demand. The sample builds a
+  `FileSkillsSource(..., script_runner=subprocess_script_runner)` so the skills' Python
+  scripts can run. Optionally folds in centrally-managed **Foundry skills** served from a
+  Foundry Toolbox MCP endpoint via `MCPSkillsSource` (opt-in; see below).
+- **Shell** — a `LocalShellTool` confined to the trade-confirmation vault
+  (`working/confirmations/`) lets the agent tidy the accumulated confirmation files (reorganize into
+  `year/month`, rename to `YYYY-MM-DD_TICKER_BUY|SELL.txt`). Guarded by a `ShellPolicy` deny-list
+  **and** a confined working directory; left at the default
+  `approval_mode="always_require"` so each command is surfaced for approval.
+- **CodeAct** — a `MontyCodeActProvider` gives the agent a sandboxed, cross-platform Python
+  interpreter to crunch portfolio numbers by writing and running code.
+- **Background agents** — a lean, web-search-only `TickerResearchAgent` is registered via
+  `create_harness_agent(background_agents=[...])`, so the main agent can fan out per-ticker research
+  concurrently and aggregate the findings.
+
+### Additional environment variables (optional)
 
 ```bash
-devui /path/to/my/agents/folder
+# Enable centrally-managed Foundry skills (Foundry Toolbox MCP endpoint URL):
+export FOUNDRY_TOOLBOX_MCP_SERVER_URL="https://<your-project>.services.ai.azure.com/.../toolboxes/<toolbox>/mcp?api-version=v1"
 ```
 
-## API Usage
+When this is not set, the sample runs with the local file skills only, and prints a note.
 
-DevUI exposes OpenAI-compatible endpoints:
+### Running
 
 ```bash
-curl -X POST http://localhost:8080/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "agent-framework",
-    "input": "What is the weather in Seattle?",
-    "extra_body": {"entity_id": "agent_directory_weather-agent_<uuid>"}
-  }'
+uv run python/samples/02-agents/harness/build_your_own_claw/claw_step03_scaling_capabilities.py
 ```
 
-List available entities:
+### What to expect
 
-```bash
-curl http://localhost:8080/v1/entities
-```
+Try these in order (the sample starts in **execute** mode — quick lookups don't need a plan):
 
-## Learn More
+1. `Value MSFT for me.` — the agent loads the `valuation` skill and follows its instructions
+   (reading references and running its script).
+2. `Score the risk of my portfolio.` — the agent reads `portfolio.csv` and loads the `risk-scoring`
+   skill.
+3. `/mode plan`, then `Tidy up my trade confirmations.` — switching to plan mode first makes the
+   agent inspect `working/confirmations/` and propose a reorganization plan before touching anything;
+   once you approve it switches to execute and uses the shell to reorganize and rename the files,
+   **prompting you to approve** each command.
+4. `Work out the total value of my portfolio.` — the agent writes and runs Python via CodeAct.
+5. `Research MSFT, NVDA and SPY and summarize the latest news.` — the agent fans the tickers out to
+   the background research agent and aggregates the results.
+6. `What's the capital of France?` — with a `financial-agent-rules` skill published to your Foundry
+   toolbox and Foundry skills enabled (`FOUNDRY_TOOLBOX_MCP_SERVER_URL`), the agent loads it,
+   recognizes the question is off-topic, and politely declines, steering you back to finance.
 
-- [DevUI Documentation](../../../packages/devui/README.md)
-- [Agent Framework Documentation](https://docs.microsoft.com/agent-framework)
-- [Sample Guidelines](../../SAMPLE_GUIDELINES.md)
-
-## Troubleshooting
-
-**Missing credentials or settings**: Check your `.env` files, confirm the required variables for the sample you are running, and make sure `az login` has completed for Azure-authenticated samples.
-
-**Import errors**: Make sure you've installed the devui package:
-
-```bash
-pip install agent-framework-devui --pre
-```
-
-**Port conflicts**: DevUI uses ports 8080 (directory mode) and 8090 (in-memory mode) by default. Close other services or specify a different port:
-
-```bash
-devui --port 8888
-```
+See the [Part 3 blog post](https://devblogs.microsoft.com/agent-framework/agent-harness-scaling-the-claw-or-harness-capabilities/)
+for more on the `financial-agent-rules` skill — including the SKILL.md to publish to your Foundry toolbox.

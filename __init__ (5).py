@@ -1,53 +1,23 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Cross-platform local shell tool for the Microsoft Agent Framework."""
+"""UI components for the harness console.
 
-from __future__ import annotations
+This module provides Textual widgets for building the harness console UI,
+including status displays, input fields, choice selectors, and scrolling panels.
+"""
 
-from ._docker import (
-    DEFAULT_IMAGE as DOCKER_DEFAULT_IMAGE,
-)
-from ._docker import (
-    DockerNotAvailableError,
-    DockerShellTool,
-    is_docker_available,
-)
-from ._environment import (
-    ShellEnvironmentProvider,
-    ShellEnvironmentProviderOptions,
-    ShellEnvironmentSnapshot,
-    ShellFamily,
-    default_instructions_formatter,
-)
-from ._executor_base import ShellExecutor
-from ._policy import ShellDecision, ShellPolicy, ShellRequest
-from ._tool import LocalShellTool
-from ._types import (
-    ShellCommandError,
-    ShellExecutionError,
-    ShellMode,
-    ShellResult,
-    ShellTimeoutError,
-)
+from .agent_status import AgentStatus
+from .list_selection import HarnessListSelection
+from .mode_help import AgentModeAndHelp
+from .prompt_rule import PromptRule
+from .scroll_panel import HarnessScrollPanel
+from .text_input import HarnessTextInput
 
 __all__ = [
-    "DOCKER_DEFAULT_IMAGE",
-    "DockerNotAvailableError",
-    "DockerShellTool",
-    "LocalShellTool",
-    "ShellCommandError",
-    "ShellDecision",
-    "ShellEnvironmentProvider",
-    "ShellEnvironmentProviderOptions",
-    "ShellEnvironmentSnapshot",
-    "ShellExecutionError",
-    "ShellExecutor",
-    "ShellFamily",
-    "ShellMode",
-    "ShellPolicy",
-    "ShellRequest",
-    "ShellResult",
-    "ShellTimeoutError",
-    "default_instructions_formatter",
-    "is_docker_available",
+    "AgentStatus",
+    "AgentModeAndHelp",
+    "HarnessListSelection",
+    "PromptRule",
+    "HarnessScrollPanel",
+    "HarnessTextInput",
 ]

@@ -1,5 +1,6 @@
 # Copyright (c) Microsoft. All rights reserved.
-"""DevUI Multi-Modal Agent with CU + file_search RAG."""
+
+"""Weather agent sample for DevUI testing."""
 
 from .agent import agent  # ty: ignore[unresolved-import]  # pyrefly: ignore
 

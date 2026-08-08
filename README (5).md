@@ -1,62 +1,35 @@
-# File Access Data Processing
+# DevUI Foundry File Search Agent
 
-This sample demonstrates how to give an `Agent` access to a folder of data files
-by attaching `FileAccessProvider` (backed by `FileSystemAgentFileStore`) as a
-context provider.
+Interactive web UI for uploading and chatting with documents, images, audio, and video using Azure Content Understanding + Foundry file_search RAG.
 
-The agent is given a `working/` folder containing `sales.csv` — ~50 rows of
-sales transaction data — and is driven through a short scripted conversation
-that exercises every tool the provider exposes:
+This is the **Foundry** variant. For the Azure OpenAI Responses API variant, see
+`agent_content_understanding_file_search_azure_openai`.
 
-| Step | Prompt | Tool(s) used |
-|---|---|---|
-| 1 | "What files do you have access to?" | `file_access_ls` |
-| 2 | "Read sales.csv and summarize…" | `file_access_read` |
-| 3 | "Calculate the total revenue per region…" | (uses previously read data) |
-| 4 | "Save a markdown report named `region_totals.md`…" | `file_access_write` |
-| 5 | "List the files again so I can confirm…" | `file_access_ls` |
+## How It Works
 
-After the run, the sample prints the final contents of `working/` so the
-written file is easy to spot.
+1. **Upload** any supported file (PDF, image, audio, video) via the DevUI chat
+2. **CU analyzes** the file — auto-selects the right analyzer per media type
+3. **Markdown extracted** by CU is uploaded to a Foundry vector store
+4. **file_search** tool is registered — LLM retrieves top-k relevant chunks
+5. **Ask questions** across all uploaded documents with token-efficient RAG
 
-## Prerequisites
+## Setup
 
-| Variable | Description |
-|---|---|
-| `FOUNDRY_PROJECT_ENDPOINT` | Your Microsoft Foundry project endpoint. |
-| `FOUNDRY_MODEL` | Chat model deployment name (e.g. `gpt-4o`). |
+1. Set environment variables (or create a `.env` file in `python/`):
+   ```bash
+   FOUNDRY_PROJECT_ENDPOINT=https://your-project.services.ai.azure.com/
+   FOUNDRY_MODEL=gpt-4.1
+   AZURE_CONTENTUNDERSTANDING_ENDPOINT=https://your-cu-resource.services.ai.azure.com/
+   ```
 
-Run `az login` before executing the sample so `AzureCliCredential` can
-authenticate.
+2. Log in with Azure CLI:
+   ```bash
+   az login
+   ```
 
-## Running the sample
+3. Run with DevUI:
+   ```bash
+   devui samples/02-agents/devui/agent_content_understanding_file_search_foundry
+   ```
 
-From `python/`:
-
-```bash
-uv run --package agent-framework-core python samples/02-agents/context_providers/file_access_data_processing/data_processing.py
-```
-
-Or directly:
-
-```bash
-python samples/02-agents/context_providers/file_access_data_processing/data_processing.py
-```
-
-## Sample data
-
-`working/sales.csv` contains January–March 2025 sales transactions with these
-columns:
-
-| Column | Description |
-|---|---|
-| `date` | Transaction date (YYYY-MM-DD) |
-| `product` | Product name |
-| `category` | Product category (Electronics, Furniture, Stationery) |
-| `quantity` | Units sold |
-| `unit_price` | Price per unit |
-| `region` | Sales region (North, South, West) |
-| `salesperson` | Name of the salesperson |
-
-The sample writes `region_totals.md` into the same folder. Delete it between
-runs if you want a clean state.
+4. Open the DevUI URL in your browser and start uploading files.

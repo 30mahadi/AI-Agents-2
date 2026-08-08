@@ -1,14 +1,22 @@
-# DevUI Multi-Modal Agent
+# DevUI File Search Agent
 
-Interactive web UI for uploading and chatting with documents, images, audio, and video using Azure Content Understanding.
+Interactive web UI for uploading and chatting with documents, images, audio, and video using Azure Content Understanding + OpenAI file_search RAG.
+
+## How It Works
+
+1. **Upload** any supported file (PDF, image, audio, video) via the DevUI chat
+2. **CU analyzes** the file — auto-selects the right analyzer per media type
+3. **Markdown extracted** by CU is uploaded to an OpenAI vector store
+4. **file_search** tool is registered — LLM retrieves top-k relevant chunks
+5. **Ask questions** across all uploaded documents with token-efficient RAG
 
 ## Setup
 
 1. Set environment variables (or create a `.env` file in `python/`):
    ```bash
-   FOUNDRY_PROJECT_ENDPOINT=https://your-project.api.azureml.ms
+   FOUNDRY_PROJECT_ENDPOINT=https://your-project.services.ai.azure.com/
    AZURE_OPENAI_RESPONSES_DEPLOYMENT_NAME=gpt-4.1
-   AZURE_CONTENTUNDERSTANDING_ENDPOINT=https://your-cu-resource.cognitiveservices.azure.com/
+   AZURE_CONTENTUNDERSTANDING_ENDPOINT=https://your-cu-resource.services.ai.azure.com/
    ```
 
 2. Log in with Azure CLI:
@@ -18,16 +26,26 @@ Interactive web UI for uploading and chatting with documents, images, audio, and
 
 3. Run with DevUI:
    ```bash
-   devui samples/02-agents/devui/agent_content_understanding
+   devui samples/02-agents/devui/agent_content_understanding_file_search_azure_openai
    ```
 
 4. Open the DevUI URL in your browser and start uploading files.
 
-## What You Can Do
+## Supported File Types
 
-- **Upload PDFs** — including scanned/image-based PDFs that LLM vision struggles with
-- **Upload images** — handwritten notes, infographics, charts
-- **Upload audio** — meeting recordings, call center calls (transcription with speaker ID)
-- **Upload video** — product demos, training videos (frame extraction + transcription)
-- **Ask questions** across all uploaded documents
-- **Check status** — "which documents are ready?" uses the auto-registered `list_documents()` tool
+| Type | Formats | CU Analyzer (auto-detected) |
+|------|---------|----------------------------|
+| Documents | PDF, DOCX, XLSX, PPTX, HTML, TXT, Markdown | `prebuilt-documentSearch` |
+| Images | JPEG, PNG, TIFF, BMP | `prebuilt-documentSearch` |
+| Audio | WAV, MP3, FLAC, OGG, M4A | `prebuilt-audioSearch` |
+| Video | MP4, MOV, AVI, WebM | `prebuilt-videoSearch` |
+
+## Comparison with the multimodal agent
+
+| Feature | multimodal_agent | file_search_agent |
+|---------|-----------------|-------------------|
+| CU extraction | ✅ Full content injected | ✅ Content indexed in vector store |
+| RAG | ❌ | ✅ file_search retrieves top-k chunks |
+| Large docs (100+ pages) | ⚠️ May exceed context window | ✅ Token-efficient |
+| Multiple large files | ⚠️ Context overflow risk | ✅ All indexed, searchable |
+| Best for | Small docs, quick inspection | Large docs, multi-file Q&A |
