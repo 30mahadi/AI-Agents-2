@@ -1,42 +1,48 @@
-# CodeAct context providers
+# Azure Provider Samples
 
-Demonstrates the provider-owned CodeAct flow with two backends:
+This folder contains Azure-backed samples for the generic OpenAI clients in
+`agent_framework.openai`.
 
-| File | Backend | Notes |
-|------|---------|-------|
-| [`code_act.py`](code_act.py) | [Hyperlight](https://github.com/hyperlight-dev/hyperlight) WASM sandbox via `HyperlightCodeActProvider` | Hardened sandbox with WASM isolation; sandbox tools called via `call_tool(...)`. |
-| [`monty_code_act.py`](monty_code_act.py) | [Monty](https://github.com/pydantic/monty) Rust-based Python interpreter via `MontyCodeActProvider` (beta) | Cross-platform pure interpreter; sandbox tools can be called as typed async functions (`await compute(...)`) or via `call_tool(...)`. |
+## Chat Completions API samples (`OpenAIChatCompletionClient`)
 
-Both providers inject an `execute_code` tool into the agent and keep the
-registered sandbox tools (`compute`, `fetch_data`) hidden from the model — the
-model invokes them from inside the sandbox.
+| File | Description |
+|------|-------------|
+| [`openai_chat_completion_client_basic.py`](openai_chat_completion_client_basic.py) | Basic Azure chat completions sample using explicit Azure settings and `credential=AzureCliCredential()`. |
+| [`openai_chat_completion_client_with_explicit_settings.py`](openai_chat_completion_client_with_explicit_settings.py) | Azure chat completions sample with explicit settings. |
+| [`openai_chat_completion_client_with_function_tools.py`](openai_chat_completion_client_with_function_tools.py) | Azure chat completions sample with function tools. |
+| [`openai_chat_completion_client_with_session.py`](openai_chat_completion_client_with_session.py) | Azure chat completions sample with session management. |
 
-## Installation
+## Responses API samples (`OpenAIChatClient`)
+
+| File | Description |
+|------|-------------|
+| [`openai_client_basic.py`](openai_client_basic.py) | Basic Azure responses sample using explicit settings and `credential=AzureCliCredential()`. |
+| [`openai_client_with_function_tools.py`](openai_client_with_function_tools.py) | Azure responses sample with function tools. |
+| [`openai_client_with_session.py`](openai_client_with_session.py) | Azure responses sample with session management. |
+| [`openai_client_with_structured_output.py`](openai_client_with_structured_output.py) | Azure responses sample with structured output. |
+
+## Environment Variables
+
+Set these before running the Azure provider samples:
+
+- `AZURE_OPENAI_ENDPOINT`
+- `AZURE_OPENAI_MODEL`
+
+Optionally, you can also set:
+
+- `AZURE_OPENAI_API_KEY`
+- `AZURE_OPENAI_API_VERSION`
+- `AZURE_OPENAI_BASE_URL`
+
+These Azure samples are written around explicit Azure inputs such as
+`credential=AzureCliCredential()`, so they stay on Azure even if `OPENAI_API_KEY` is also present.
+
+## Optional Dependencies
+
+Credential-based samples require `azure-identity`:
 
 ```bash
-pip install agent-framework-hyperlight agent-framework-foundry --pre  # Hyperlight sample
-pip install agent-framework-monty agent-framework-foundry --pre       # Monty sample
+pip install azure-identity
 ```
 
-> The Hyperlight Wasm backend is currently published only for `linux/x86_64` and
-> `win32/AMD64` with Python `<3.14`. On other platforms `execute_code` will fail
-> at runtime when it tries to create the sandbox.
->
-> Monty is cross-platform and has no hypervisor/WASM backend dependency, but it
-> interprets a Python subset (e.g. `os`/network/subprocess access is blocked).
-> The beta `agent-framework-monty` package is included in `agent-framework[all]`.
-
-## Prerequisites
-
-- A Microsoft Foundry project endpoint (`FOUNDRY_PROJECT_ENDPOINT`)
-- A deployed model (`FOUNDRY_MODEL`)
-- Azure CLI authenticated (`az login`)
-
-## Run
-
-```bash
-python code_act.py        # Hyperlight
-python monty_code_act.py  # Monty
-```
-
-See the source files for the full annotated examples.
+Run `az login` before executing the credential-based samples.
