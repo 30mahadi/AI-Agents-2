@@ -1,24 +1,30 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""New-pattern Mem0 context provider using ContextProvider.
+"""New-pattern Redis context provider using ContextProvider.
 
-This module provides ``Mem0ContextProvider``, built on the new
+This module provides ``RedisContextProvider``, built on the new
 :class:`ContextProvider` hooks pattern.
 """
 
 from __future__ import annotations
 
-import asyncio
-import logging
+import json
 import sys
-from collections.abc import Awaitable
-from contextlib import AbstractAsyncContextManager
-from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias, TypedDict
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
+import numpy as np
 from agent_framework import Message
 from agent_framework._sessions import AgentSession, ContextProvider, SessionContext
 from agent_framework._telemetry import mark_feature_used
-from mem0 import AsyncMemory, AsyncMemoryClient
+from agent_framework.exceptions import (
+    AgentException,
+    IntegrationInvalidRequestException,
+)
+from redisvl.index import AsyncSearchIndex
+from redisvl.query import AggregateHybridQuery, TextQuery
+from redisvl.query.filter import FilterExpression, Tag
+from redisvl.utils.token_escaper import TokenEscaper
+from redisvl.utils.vectorize import BaseVectorizer
 
 from ._feature_usage import FeatureIndex
 
@@ -27,112 +33,89 @@ if sys.version_info >= (3, 11):
 else:
     from typing_extensions import Self  # pragma: no cover
 
+if sys.version_info >= (3, 12):
+    from typing import override  # pragma: no cover
+else:
+    from typing_extensions import override  # pragma: no cover
+
 if TYPE_CHECKING:
     from agent_framework._agents import SupportsAgentRun
 
-logger = logging.getLogger(__name__)
-MemoryRecord: TypeAlias = dict[str, object]
 
+class RedisContextProvider(ContextProvider):
+    """Redis context provider using the new ContextProvider hooks pattern.
 
-class SearchResults(TypedDict):
-    results: list[MemoryRecord]
-
-
-SearchResponse: TypeAlias = list[MemoryRecord] | SearchResults
-
-
-class Mem0ContextProvider(ContextProvider):
-    """Mem0 context provider using the new ContextProvider hooks pattern.
-
-    Integrates Mem0 for persistent semantic memory, searching and storing
-    memories via the Mem0 API.
-
-    The provider keeps the storage scope and the retrieval scope separate:
-
-    * ``application_id`` / ``agent_id`` / ``user_id`` are the **storage scope**. They are
-      stamped onto every memory written by :meth:`after_run` and are never used to
-      retrieve memories.
-    * ``search_application_id`` / ``search_agent_id`` / ``search_user_id`` are the
-      **retrieval scope** used by :meth:`before_run`.
-
-    Retrieval scope values never inherit from the storage scope. If no ``search_*``
-    value is configured, no memories are retrieved. This prevents a memory written
-    under a shared ``agent_id`` from being read back by an unrelated user, since
-    agent-wide retrieval must be requested explicitly via ``search_agent_id``.
+    Stores context in Redis and retrieves scoped context via full-text or
+    optional hybrid vector search.
     """
 
     DEFAULT_CONTEXT_PROMPT = "## Memories\nConsider the following memories when answering user questions:"
-    DEFAULT_SOURCE_ID: ClassVar[str] = "mem0"
+    DEFAULT_SOURCE_ID: ClassVar[str] = "redis"
 
     def __init__(
         self,
         source_id: str = DEFAULT_SOURCE_ID,
-        mem0_client: AsyncMemory | AsyncMemoryClient | None = None,
-        api_key: str | None = None,
+        redis_url: str = "redis://localhost:6379",
+        index_name: str = "context",
+        prefix: str = "context",
+        *,
+        redis_vectorizer: BaseVectorizer | None = None,
+        vector_field_name: str | None = None,
+        vector_algorithm: Literal["flat", "hnsw"] | None = None,
+        vector_distance_metric: Literal["cosine", "ip", "l2"] | None = None,
         application_id: str | None = None,
         agent_id: str | None = None,
         user_id: str | None = None,
-        search_application_id: str | None = None,
-        search_agent_id: str | None = None,
-        search_user_id: str | None = None,
-        *,
         context_prompt: str | None = None,
-    ) -> None:
-        """Initialize the Mem0 context provider.
+        redis_index: Any = None,
+        overwrite_index: bool = False,
+    ):
+        """Create a Redis Context Provider.
 
         Args:
             source_id: Unique identifier for this provider instance.
-            mem0_client: A pre-created Mem0 MemoryClient or None to create a default client.
-            api_key: The API key for authenticating with the Mem0 API.
-            application_id: The application ID that stored memories are stamped with. Platform-only:
-                the OSS ``AsyncMemory`` client does not recognize an application
-                scope (it scopes only by user_id/agent_id in this provider), so
-                application_id cannot be used with an OSS client.
-            agent_id: The agent ID that stored memories are stamped with.
-            user_id: The user ID that stored memories are stamped with.
-            search_application_id: The application ID to retrieve memories for. Platform-only,
-                like ``application_id``.
-            search_agent_id: The agent ID to retrieve memories for. Setting this retrieves
-                memories stored by **any** user under that agent, so only set it for
-                agent-wide knowledge that is safe to share across users.
-            search_user_id: The user ID to retrieve memories for.
-            context_prompt: The prompt to prepend to retrieved memories.
-
-        Remarks:
-            The ``search_*`` parameters do not default to their storage-scope counterparts.
-            When none of them are set, :meth:`before_run` retrieves nothing and logs a warning.
+            redis_url: The Redis server URL.
+            index_name: The name of the Redis index.
+            prefix: The prefix for all keys in the Redis database.
+            redis_vectorizer: The vectorizer to use for Redis.
+            vector_field_name: The name of the vector field in Redis.
+            vector_algorithm: The algorithm to use for vector search.
+            vector_distance_metric: The distance metric to use for vector search.
+            application_id: The application ID to scope the context.
+            agent_id: The agent ID to scope the context.
+            user_id: The user ID to scope the context.
+            context_prompt: The context prompt to use for the provider.
+            redis_index: The Redis index to use for the provider.
+            overwrite_index: Whether to overwrite the existing Redis index.
         """
         super().__init__(source_id)
-        should_close_client = False
-        if mem0_client is None:
-            mem0_client = AsyncMemoryClient(api_key=api_key)
-            should_close_client = True
-
-        self.api_key = api_key
+        self.redis_url = redis_url
+        self.index_name = index_name
+        self.prefix = prefix
+        if redis_vectorizer is not None and not isinstance(redis_vectorizer, BaseVectorizer):
+            raise AgentException(
+                f"The redis vectorizer is not a valid type, got: {type(redis_vectorizer)}, expected: BaseVectorizer."
+            )
+        self.redis_vectorizer = redis_vectorizer
+        self.vector_field_name = vector_field_name
+        self.vector_algorithm: Literal["flat", "hnsw"] | None = vector_algorithm
+        self.vector_distance_metric: Literal["cosine", "ip", "l2"] | None = vector_distance_metric
         self.application_id = application_id
         self.agent_id = agent_id
         self.user_id = user_id
-        self.search_application_id = search_application_id
-        self.search_agent_id = search_agent_id
-        self.search_user_id = search_user_id
         self.context_prompt = context_prompt or self.DEFAULT_CONTEXT_PROMPT
-        self.mem0_client = mem0_client
-        self._should_close_client = should_close_client
-        self._warned_no_search_scope = False
-
-    async def __aenter__(self) -> Self:
-        """Async context manager entry."""
-        if self.mem0_client and isinstance(self.mem0_client, AbstractAsyncContextManager):
-            await self.mem0_client.__aenter__()
-        return self
-
-    async def __aexit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: Any) -> None:
-        """Async context manager exit."""
-        if self._should_close_client and self.mem0_client and isinstance(self.mem0_client, AbstractAsyncContextManager):
-            await self.mem0_client.__aexit__(exc_type, exc_val, exc_tb)  # pyright: ignore[reportUnknownMemberType]
+        self.overwrite_index = overwrite_index
+        self._token_escaper: TokenEscaper = TokenEscaper()
+        self._index_initialized: bool = False
+        self._schema_dict: dict[str, Any] | None = None
+        index = redis_index or AsyncSearchIndex.from_dict(  # pyright: ignore[reportUnknownMemberType]
+            self.schema_dict, redis_url=self.redis_url, validate_on_load=True
+        )
+        self.redis_index: Any = index
 
     # -- Hooks pattern ---------------------------------------------------------
 
+    @override
     async def before_run(
         self,
         *,
@@ -141,99 +124,24 @@ class Mem0ContextProvider(ContextProvider):
         context: SessionContext,
         state: dict[str, Any],
     ) -> None:
-        """Search Mem0 for relevant memories and add to the session context."""
-        mark_feature_used(FeatureIndex.MEM0)
+        """Retrieve scoped context from Redis and add to the session context."""
+        mark_feature_used(FeatureIndex.REDIS)
         self._validate_filters()
-        if not (self.search_user_id or self.search_agent_id or self.search_application_id):
-            if not self._warned_no_search_scope:
-                self._warned_no_search_scope = True
-                logger.warning(
-                    "Mem0ContextProvider has no retrieval scope configured, so no memories will be retrieved. "
-                    "Set search_user_id, search_agent_id and/or search_application_id."
-                )
-            return
-
         input_text = "\n".join(msg.text for msg in context.input_messages if msg and msg.text and msg.text.strip())
         if not input_text.strip():
             return
 
-        # Query entity partitions independently to bypass strict logical AND limitations
-        # Mem0 OSS and Platform SDKs expose inconsistent search typings.
-        search_tasks: list[Awaitable[Any]] = []
-
-        # 1. Query User partition independently
-        if self.search_user_id:
-            user_kwargs = self._build_search_kwargs(input_text, "user_id", self.search_user_id)
-            search_tasks.append(self.mem0_client.search(**user_kwargs))  # type: ignore[reportUnknownMemberType, reportUnknownArgumentType]
-
-        # 2. Query Agent partition independently
-        if self.search_agent_id:
-            agent_kwargs = self._build_search_kwargs(input_text, "agent_id", self.search_agent_id)
-            search_tasks.append(self.mem0_client.search(**agent_kwargs))  # type: ignore[reportUnknownMemberType, reportUnknownArgumentType]
-
-        # Fall back to an app-scoped search when only search_application_id is configured.
-        if not search_tasks and self.search_application_id:
-            app_kwargs: dict[str, Any] = {"query": input_text, "filters": {"app_id": self.search_application_id}}
-            search_tasks.append(self.mem0_client.search(**app_kwargs))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
-        if not search_tasks:
-            return
-
-        results: list[SearchResponse | BaseException] = await asyncio.gather(*search_tasks, return_exceptions=True)
-
-        # Merge and deduplicate results
-        memories: list[MemoryRecord] = []
-        seen_memory_ids: set[str] = set()
-        failed_tasks_count: int = 0
-
-        for search_response in results:
-            if isinstance(search_response, asyncio.CancelledError):
-                raise search_response
-
-            if isinstance(search_response, BaseException):
-                failed_tasks_count += 1
-                logger.error(
-                    "Mem0 partition search task failed: %s",
-                    search_response,
-                    exc_info=(type(search_response), search_response, search_response.__traceback__),
-                )
-                continue
-
-            current_memories: list[MemoryRecord] = []
-            if isinstance(search_response, list):
-                current_memories = [mem for mem in search_response if isinstance(mem, dict)]
-            elif isinstance(search_response, dict):
-                results_field = search_response.get("results")
-                if isinstance(results_field, list):
-                    current_memories = [item for item in results_field if isinstance(item, dict)]
-                else:
-                    logger.warning(
-                        "Unexpected Mem0 search response format: %s",
-                        type(results_field).__name__,
-                    )
-
-            for mem in current_memories:
-                mem_id = mem.get("id")
-                if mem_id is not None and not isinstance(mem_id, str):
-                    mem_id = str(mem_id)
-
-                if mem_id is not None and mem_id in seen_memory_ids:
-                    continue
-
-                if mem_id is not None:
-                    seen_memory_ids.add(mem_id)
-
-                memories.append(mem)
-
-        if failed_tasks_count == len(search_tasks):
-            logger.error("All Mem0 retrieval tasks failed. Context provider is unable to verify memory state.")
-
-        line_separated_memories = "\n".join(str(memory.get("memory", "")) for memory in memories)
+        memories = await self._redis_search(text=input_text)
+        line_separated_memories = "\n".join(
+            str(memory.get("content", "")) for memory in memories if memory.get("content")
+        )
         if line_separated_memories:
             context.extend_messages(
                 self.source_id,
                 [Message(role="user", contents=[f"{self.context_prompt}\n{line_separated_memories}"])],
             )
 
+    @override
     async def after_run(
         self,
         *,
@@ -242,75 +150,285 @@ class Mem0ContextProvider(ContextProvider):
         context: SessionContext,
         state: dict[str, Any],
     ) -> None:
-        """Store request/response messages to Mem0 for future retrieval."""
-        mark_feature_used(FeatureIndex.MEM0)
+        """Store request/response messages to Redis for future retrieval."""
+        mark_feature_used(FeatureIndex.REDIS)
         self._validate_filters()
 
         messages_to_store: list[Message] = list(context.input_messages)
         if context.response and context.response.messages:
             messages_to_store.extend(context.response.messages)
 
-        def get_role_value(role: Any) -> str:
-            return role.value if hasattr(role, "value") else str(role)
-
-        messages: list[dict[str, str]] = [
-            {"role": get_role_value(message.role), "content": message.text}
-            for message in messages_to_store
-            if get_role_value(message.role) in {"user", "assistant", "system"} and message.text and message.text.strip()
-        ]
-
+        messages: list[dict[str, Any]] = []
+        for message in messages_to_store:
+            if message.role in {"user", "assistant", "system"} and message.text and message.text.strip():
+                shaped: dict[str, Any] = {
+                    "role": message.role,
+                    "content": message.text,
+                    "conversation_id": context.session_id,
+                    "message_id": message.message_id,
+                    "author_name": message.author_name,
+                }
+                messages.append(shaped)
         if messages:
-            add_kwargs: dict[str, Any] = {
-                "messages": messages,
-            }
+            await self._add(data=messages, session_id=context.session_id)
 
-            if isinstance(self.mem0_client, AsyncMemory):
-                add_kwargs["user_id"] = self.user_id
-                add_kwargs["agent_id"] = self.agent_id
-            else:
-                add_kwargs["filters"] = self._build_filters()
+    # -- Internal methods (ported from RedisProvider) --------------------------
 
-            await self.mem0_client.add(**add_kwargs)  # type: ignore[misc, call-arg]
+    @property
+    def schema_dict(self) -> dict[str, Any]:
+        """Get the Redis schema dictionary, computing and caching it on first access."""
+        if self._schema_dict is None:
+            vector_dims = self.redis_vectorizer.dims if self.redis_vectorizer is not None else None
+            vector_datatype = self.redis_vectorizer.dtype if self.redis_vectorizer is not None else None
+            self._schema_dict = self._build_schema_dict(
+                index_name=self.index_name,
+                prefix=self.prefix,
+                vector_field_name=self.vector_field_name,
+                vector_dims=vector_dims,
+                vector_datatype=vector_datatype,
+                vector_algorithm=self.vector_algorithm,
+                vector_distance_metric=self.vector_distance_metric,
+            )
+        return self._schema_dict
 
-    # -- Internal methods ------------------------------------------------------
+    def _build_filter_from_dict(self, filters: dict[str, str | None]) -> Any | None:
+        """Builds a combined filter expression from simple equality tags."""
+        parts: list[FilterExpression] = [Tag(k) == v for k, v in filters.items() if v]
+        if not parts:
+            return None
+        combined = parts[0]
+        for part in parts[1:]:
+            combined = combined & part
+        return combined
+
+    def _build_schema_dict(
+        self,
+        *,
+        index_name: str,
+        prefix: str,
+        vector_field_name: str | None,
+        vector_dims: int | None,
+        vector_datatype: str | None,
+        vector_algorithm: Literal["flat", "hnsw"] | None,
+        vector_distance_metric: Literal["cosine", "ip", "l2"] | None,
+    ) -> dict[str, Any]:
+        """Builds the RediSearch schema configuration dictionary."""
+        fields: list[dict[str, Any]] = [
+            {"name": "role", "type": "tag"},
+            {"name": "mime_type", "type": "tag"},
+            {"name": "content", "type": "text"},
+            {"name": "conversation_id", "type": "tag"},
+            {"name": "message_id", "type": "tag"},
+            {"name": "author_name", "type": "tag"},
+            {"name": "application_id", "type": "tag"},
+            {"name": "agent_id", "type": "tag"},
+            {"name": "user_id", "type": "tag"},
+            {"name": "thread_id", "type": "tag"},
+        ]
+        if vector_field_name is not None and vector_dims is not None:
+            fields.append({
+                "name": vector_field_name,
+                "type": "vector",
+                "attrs": {
+                    "algorithm": (vector_algorithm or "hnsw"),
+                    "dims": int(vector_dims),
+                    "distance_metric": (vector_distance_metric or "cosine"),
+                    "datatype": (vector_datatype or "float32"),
+                },
+            })
+        return {
+            "index": {"name": index_name, "prefix": prefix, "key_separator": ":", "storage_type": "hash"},
+            "fields": fields,
+        }
+
+    async def _ensure_index(self) -> None:
+        """Initialize the search index."""
+        if self._index_initialized:
+            return
+        index_exists = await self.redis_index.exists()
+        if not self.overwrite_index and index_exists:
+            await self._validate_schema_compatibility()
+        await self.redis_index.create(overwrite=self.overwrite_index, drop=False)
+        self._index_initialized = True
+
+    async def _validate_schema_compatibility(self) -> None:
+        """Validate that existing index schema matches current configuration."""
+        TAG_DEFAULTS = {"separator": ",", "case_sensitive": False, "withsuffixtrie": False}
+        TEXT_DEFAULTS = {"weight": 1.0, "no_stem": False}
+
+        def _significant_index(i: dict[str, Any]) -> dict[str, Any]:
+            return {k: i.get(k) for k in ("name", "prefix", "key_separator", "storage_type")}
+
+        def _sig_tag(attrs: dict[str, Any] | None) -> dict[str, Any]:
+            a = {**TAG_DEFAULTS, **(attrs or {})}
+            return {k: a[k] for k in ("separator", "case_sensitive", "withsuffixtrie")}
+
+        def _sig_text(attrs: dict[str, Any] | None) -> dict[str, Any]:
+            a = {**TEXT_DEFAULTS, **(attrs or {})}
+            return {k: a[k] for k in ("weight", "no_stem")}
+
+        def _sig_vector(attrs: dict[str, Any] | None) -> dict[str, Any]:
+            a = {**(attrs or {})}
+            return {k: a.get(k) for k in ("algorithm", "dims", "distance_metric", "datatype")}
+
+        def _schema_signature(schema: dict[str, Any]) -> dict[str, Any]:
+            sig: dict[str, Any] = {"index": _significant_index(schema.get("index", {})), "fields": {}}
+            for f in schema.get("fields", []):
+                name, ftype = f.get("name"), f.get("type")
+                if not name:
+                    continue
+                if ftype == "tag":
+                    sig["fields"][name] = {"type": "tag", "attrs": _sig_tag(f.get("attrs"))}
+                elif ftype == "text":
+                    sig["fields"][name] = {"type": "text", "attrs": _sig_text(f.get("attrs"))}
+                elif ftype == "vector":
+                    sig["fields"][name] = {"type": "vector", "attrs": _sig_vector(f.get("attrs"))}
+                else:
+                    sig["fields"][name] = {"type": ftype}
+            return sig
+
+        existing_index: Any = await AsyncSearchIndex.from_existing(  # pyright: ignore[reportUnknownMemberType]
+            self.index_name, redis_url=self.redis_url
+        )
+        existing_schema = existing_index.schema.to_dict()
+        current_schema = self.schema_dict
+        existing_sig = _schema_signature(existing_schema)
+        current_sig = _schema_signature(current_schema)
+        if existing_sig != current_sig:
+            raise ValueError(
+                "Existing Redis index schema is incompatible with the current configuration.\n"
+                f"Existing (significant): {json.dumps(existing_sig, indent=2, sort_keys=True)}\n"
+                f"Current  (significant): {json.dumps(current_sig, indent=2, sort_keys=True)}\n"
+                "Set overwrite_index=True to rebuild if this change is intentional."
+            )
+
+    async def _add(
+        self,
+        *,
+        data: dict[str, Any] | list[dict[str, Any]],
+        session_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Inserts one or many documents with partition fields populated."""
+        self._validate_filters()
+        await self._ensure_index()
+        docs = data if isinstance(data, list) else [data]
+
+        prepared: list[dict[str, Any]] = []
+        for doc in docs:
+            d = dict(doc)
+            d.setdefault("application_id", self.application_id)
+            d.setdefault("agent_id", self.agent_id)
+            d.setdefault("user_id", self.user_id)
+            d.setdefault("thread_id", session_id)
+            d.setdefault("conversation_id", session_id)
+            if "content" not in d:
+                raise IntegrationInvalidRequestException("add() requires a 'content' field in data")
+            if self.vector_field_name:
+                d.setdefault(self.vector_field_name, None)
+            prepared.append(d)
+
+        if self.redis_vectorizer and self.vector_field_name:
+            text_list = [d["content"] for d in prepared]
+            embeddings = await self.redis_vectorizer.aembed_many(  # pyright: ignore[reportUnknownMemberType]
+                text_list, batch_size=len(text_list)
+            )
+            for i, d in enumerate(prepared):
+                vec = np.asarray(embeddings[i], dtype=np.float32).tobytes()
+                field_name: str = self.vector_field_name
+                d[field_name] = vec
+
+        await self.redis_index.load(prepared)
+
+    async def _redis_search(
+        self,
+        text: str,
+        *,
+        session_id: str | None = None,
+        text_scorer: str = "BM25STD",
+        filter_expression: Any | None = None,
+        return_fields: list[str] | None = None,
+        num_results: int = 10,
+        alpha: float = 0.7,
+    ) -> list[dict[str, Any]]:
+        """Runs a text or hybrid vector-text search with optional filters."""
+        await self._ensure_index()
+        self._validate_filters()
+
+        q = (text or "").strip()
+        if not q:
+            raise IntegrationInvalidRequestException("text_search() requires non-empty text")
+        num_results = max(int(num_results or 10), 1)
+
+        combined_filter = self._build_filter_from_dict({
+            "application_id": self.application_id,
+            "agent_id": self.agent_id,
+            "user_id": self.user_id,
+            "thread_id": session_id,
+            "conversation_id": session_id,
+        })
+        if filter_expression is not None:
+            combined_filter = (combined_filter & filter_expression) if combined_filter else filter_expression
+
+        return_fields = (
+            return_fields
+            if return_fields is not None
+            else ["content", "role", "application_id", "agent_id", "user_id", "thread_id"]
+        )
+
+        try:
+            if self.redis_vectorizer and self.vector_field_name:
+                vector = await self.redis_vectorizer.aembed(q)  # pyright: ignore[reportUnknownMemberType]
+                query = AggregateHybridQuery(
+                    text=q,
+                    text_field_name="content",
+                    vector=vector,
+                    vector_field_name=self.vector_field_name,
+                    text_scorer=text_scorer,
+                    filter_expression=combined_filter,
+                    alpha=alpha,
+                    dtype=self.redis_vectorizer.dtype,
+                    num_results=num_results,
+                    return_fields=return_fields,
+                    stopwords=None,
+                )
+                return await self.redis_index.query(query)
+            query = TextQuery(
+                text=q,
+                text_field_name="content",
+                text_scorer=text_scorer,
+                filter_expression=combined_filter,
+                num_results=num_results,
+                return_fields=return_fields,
+                stopwords=None,
+            )
+            return await self.redis_index.query(query)
+        except Exception as exc:  # pragma: no cover
+            raise IntegrationInvalidRequestException(f"Redis text search failed: {exc}") from exc
 
     def _validate_filters(self) -> None:
-        """Validates that at least one usable filter is provided for the configured client."""
+        """Validates that at least one filter is provided."""
         if not self.agent_id and not self.user_id and not self.application_id:
             raise ValueError("At least one of the filters: agent_id, user_id, or application_id is required.")
-        if isinstance(self.mem0_client, AsyncMemory) and (self.application_id or self.search_application_id):
-            raise ValueError(
-                "application_id is not supported by the OSS AsyncMemory client, which scopes "
-                "memories only by user_id/agent_id. Remove application_id or use AsyncMemoryClient."
-            )
 
-    def _build_search_kwargs(self, input_text: str, entity_key: str, entity_value: str) -> dict[str, Any]:
-        """Build search keyword arguments formatted for OSS vs Platform clients."""
-        kwargs: dict[str, Any] = {"query": input_text}
+    async def search_all(self, page_size: int = 200) -> list[dict[str, Any]]:
+        """Returns all documents in the index."""
+        from redisvl.query import FilterQuery
 
-        if self.search_application_id and isinstance(self.mem0_client, AsyncMemory):
-            raise ValueError(
-                "application_id is not supported by the OSS AsyncMemory client, which scopes "
-                "memories only by user_id/agent_id. Remove application_id or use AsyncMemoryClient."
-            )
+        out: list[dict[str, Any]] = []
+        async for batch in self.redis_index.paginate(
+            FilterQuery(FilterExpression("*"), return_fields=[], num_results=page_size),
+            page_size=page_size,
+        ):
+            out.extend(batch)
+        return out
 
-        filters: dict[str, Any] = {entity_key: entity_value}
-        if self.search_application_id and not isinstance(self.mem0_client, AsyncMemory):
-            filters["app_id"] = self.search_application_id
-        kwargs["filters"] = filters
+    async def __aenter__(self) -> Self:
+        """Async context manager entry."""
+        return self
 
-        return kwargs
-
-    def _build_filters(self) -> dict[str, Any]:
-        """Build storage identity filters from initialization parameters."""
-        filters: dict[str, Any] = {}
-        if self.user_id:
-            filters["user_id"] = self.user_id
-        if self.agent_id:
-            filters["agent_id"] = self.agent_id
-        if self.application_id:
-            filters["app_id"] = self.application_id
-        return filters
+    async def __aexit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: Any) -> None:
+        """Async context manager exit."""
 
 
-__all__ = ["Mem0ContextProvider"]
+__all__ = ["RedisContextProvider"]

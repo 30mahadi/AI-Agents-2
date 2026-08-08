@@ -1,38 +1,59 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Public types for ``agent-framework-monty``.
-
-Mirrors ``agent_framework_hyperlight._types`` where the Monty runtime exposes
-an equivalent concept so users can move between the two providers with minimal
-churn.
-"""
+"""Shared types for the local shell tool."""
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Literal, NamedTuple, TypeAlias
+from dataclasses import dataclass
+from typing import Literal
 
-#: Allowed Monty mount modes. ``overlay`` (the Monty default) buffers writes
-#: in-memory and is therefore not visible to the host after execution.
-#: ``read-only`` rejects writes. ``read-write`` writes through to the host
-#: directory.
-MountMode: TypeAlias = Literal["overlay", "read-only", "read-write"]
+ShellMode = Literal["persistent", "stateless"]
 
 
-class FileMount(NamedTuple):
-    """Map a host directory into the Monty sandbox.
+@dataclass(frozen=True)
+class ShellResult:
+    """The outcome of a single shell command invocation.
 
-    Mirrors :class:`agent_framework_hyperlight.FileMount` with two extra
-    fields that surface Monty's underlying ``MountDir`` capabilities:
-    ``mode`` selects read-only / read-write / overlay semantics, and
-    ``write_bytes_limit`` caps the total bytes written through this mount.
+    Attributes:
+        stdout: Captured standard output, possibly truncated.
+        stderr: Captured standard error, possibly truncated.
+        exit_code: The exit status reported by the shell or subprocess.
+        duration_ms: How long the command took, in milliseconds.
+        truncated: ``True`` when stdout or stderr was truncated to fit
+            ``max_output_bytes``.
+        timed_out: ``True`` when the command was killed because it exceeded
+            the configured timeout.
     """
 
-    host_path: str | Path
-    mount_path: str
-    mode: MountMode = "overlay"
-    write_bytes_limit: int | None = None
+    stdout: str
+    stderr: str
+    exit_code: int
+    duration_ms: int
+    truncated: bool = False
+    timed_out: bool = False
+
+    def format_for_model(self) -> str:
+        """Format the result as a single text block suitable for an LLM."""
+        parts: list[str] = []
+        if self.stdout:
+            parts.append(self.stdout)
+        if self.stderr:
+            parts.append(f"stderr: {self.stderr}")
+        if self.truncated:
+            parts.append("[output truncated]")
+        if self.timed_out:
+            parts.append("[command timed out]")
+        parts.append(f"exit_code: {self.exit_code}")
+        return "\n".join(parts)
 
 
-FileMountHostPath: TypeAlias = str | Path
-FileMountInput: TypeAlias = str | tuple[FileMountHostPath, str] | FileMount
+class ShellExecutionError(RuntimeError):
+    """Base class for shell-tool execution failures."""
+
+
+class ShellTimeoutError(ShellExecutionError):
+    """Raised when a command exceeds the configured timeout."""
+
+
+class ShellCommandError(ShellExecutionError):
+    """Raised when a command is rejected by the configured policy."""

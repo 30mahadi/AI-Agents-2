@@ -1,121 +1,171 @@
-# Agent Framework Orchestrations
+# agent-framework-tools
 
-Orchestration patterns for Microsoft Agent Framework. This package provides high-level builders for common multi-agent workflow patterns.
+Beta built-in tools for the Microsoft Agent Framework. A home for first-party
+Python tools that plug into any chat client's shell / function surface. The
+first tool is `LocalShellTool`.
 
 ## Installation
 
 ```bash
-pip install agent-framework-orchestrations
+pip install agent-framework-tools --pre
 ```
 
-## Orchestration Patterns
-
-### SequentialBuilder
-
-Chain agents/executors in sequence, passing conversation context along:
+## `LocalShellTool` quick start
 
 ```python
-from agent_framework.orchestrations import SequentialBuilder
+import asyncio
+from agent_framework import Agent
+from agent_framework.openai import OpenAIChatClient
+from agent_framework.tools import LocalShellTool
 
-workflow = SequentialBuilder(participants=[agent1, agent2, agent3]).build()
 
-# Preserve agent1 and agent2 as visible progress, while the default builder output remains Workflow Output.
-workflow = SequentialBuilder(
-    participants=[agent1, agent2, agent3],
-    intermediate_output_from=[agent1, agent2],
-).build()
+async def main() -> None:
+    client = OpenAIChatClient(model="gpt-5.4-nano")
+    async with LocalShellTool() as shell:
+        agent = Agent(
+            client=client,
+            instructions="You are a helpful assistant that can run shell commands.",
+            tools=[client.get_shell_tool(func=shell.as_function())],
+        )
+        result = await agent.run("Print the current working directory.")
+        print(result.text)
+
+
+asyncio.run(main())
 ```
 
-### ConcurrentBuilder
+### Modes
 
-Fan-out to multiple agents in parallel, then aggregate results:
+- **Persistent** (default): a single long-lived shell session. `cd`, `export`,
+  and shell functions persist across tool invocations.
+- **Stateless** (`mode="stateless"`): each command runs in a fresh subprocess.
+
+### Safety
+
+> **`LocalShellTool` is not a sandbox.** It runs commands directly on the
+> host with the agent process's privileges. The actual security boundary
+> is **approval-in-the-loop**. For untrusted input use a sandboxed
+> executor — see [`agent-framework-hyperlight`](#relationship-to-agent-framework-hyperlight).
+
+Defenses (in priority order):
+
+- **Approval-in-the-loop** — every command surfaces as a
+  `user_input_request`; nothing runs without consent. Disabling this
+  requires `acknowledge_unsafe=True`.
+- **Process-tree termination on timeout** via `psutil`, so child
+  processes (`make`, watchers, network tools) cannot survive the timeout.
+- **Output truncation** to 64 KiB (head + tail with marker).
+- **Audit hook** (`on_command=…`) for SIEM / append-only logs.
+- **Optional command-pattern filter** via `ShellPolicy(denylist=[...],
+  allowlist=[...])`. **Empty by default.** This is a UX pre-filter, not a
+  security boundary — operators are expected to supply patterns that
+  match their workload (and they can be defeated by trivial obfuscation
+  such as `\rm -rf /`, `${RM:=rm} -rf /`, `python -c "…"`, encoded
+  payloads, or PowerShell-native equivalents). Real isolation comes from
+  approval gating and the sandbox tier (`DockerShellTool`). See
+  `tests/test_security.py` for the documented residual risk surface.
+
+Override with `ShellPolicy`:
 
 ```python
-from agent_framework.orchestrations import ConcurrentBuilder
+from agent_framework.tools import LocalShellTool, ShellPolicy
 
-workflow = ConcurrentBuilder(participants=[agent1, agent2, agent3]).build()
-```
-
-### HandoffBuilder
-
-Decentralized agent routing where agents decide handoff targets:
-
-```python
-from agent_framework.orchestrations import HandoffBuilder
-
-workflow = (
-    HandoffBuilder()
-    .participants([triage, billing, support])
-    .with_start_agent(triage)
-    .build()
+shell = LocalShellTool(
+    policy=ShellPolicy(allowlist=[r"^ls\b", r"^cat\b", r"^git status$"]),
+    approval_mode="never_require",
+    acknowledge_unsafe=True,  # required to bypass approval
 )
 ```
 
-### GroupChatBuilder
+### Cross-OS
 
-Orchestrator-directed multi-agent conversations:
+- **Windows**: `pwsh -NoProfile -Command -` (falls back to `powershell.exe`).
+- **Linux / macOS**: `/bin/bash --noprofile --norc` (falls back to `/bin/sh`).
+- Override via the `shell=` constructor argument or the
+  `AGENT_FRAMEWORK_SHELL` environment variable.
+
+## `ShellEnvironmentProvider` — context provider
+
+A model talking to a PowerShell session will sometimes default to bash
+syntax (`export FOO=bar`, `ls -la`, `> /dev/null`) and vice versa.
+`ShellEnvironmentProvider` is an `AIContextProvider` that probes the live
+shell once per session — family, version, OS, working directory, and a
+configurable list of CLI tools (`git`, `node`, `python`, `docker` by
+default) — and injects a system-prompt block describing the shell idiom
+to use and the available CLIs.
 
 ```python
-from agent_framework.orchestrations import GroupChatBuilder
+from agent_framework.tools import (
+    LocalShellTool,
+    ShellEnvironmentProvider,
+    ShellEnvironmentProviderOptions,
+)
 
-workflow = GroupChatBuilder(
-    participants=[agent1, agent2],
-    selection_func=my_selector,
-    intermediate_output_from=[agent1, agent2],
-).build()
+shell = LocalShellTool()
+provider = ShellEnvironmentProvider(
+    shell,
+    ShellEnvironmentProviderOptions(probe_tools=("git", "uv", "node")),
+)
+agent = Agent(
+    client=client,
+    tools=[client.get_shell_tool(func=shell.as_function())],
+    context_providers=[provider],
+)
 ```
 
-### MagenticBuilder
+Probe failures from expected error types (timeouts, policy rejections,
+spawn failures) are recorded as `None` fields in the snapshot rather
+than raised; a missing CLI never fails the agent. A failed first probe
+does not poison the cache — the next call retries.
 
-Sophisticated multi-agent orchestration using the Magentic One pattern:
+## `DockerShellTool` — sandboxed tier
+
+When commands originate from untrusted input (e.g. the model is acting on
+prompt-injected document content), prefer `DockerShellTool`. With the
+default isolation flags and a trusted container runtime, the container
+is the intended security boundary and approval gating becomes optional.
 
 ```python
-from agent_framework.orchestrations import MagenticBuilder
+import asyncio
+from agent_framework.tools import DockerShellTool
 
-workflow = MagenticBuilder(
-    participants=[researcher, writer, reviewer],
-    manager_agent=manager_agent,
-    intermediate_output_from=[researcher, writer, reviewer],
-).build()
+
+async def main() -> None:
+    async with DockerShellTool(
+        image="mcr.microsoft.com/azurelinux/base/core:3.0",
+        approval_mode="never_require",  # container is the boundary
+    ) as shell:
+        result = await shell.run("uname -a && id")
+        print(result.stdout)
+
+
+asyncio.run(main())
 ```
 
-## Output Selection
+Defaults applied to every container:
 
-Orchestration builders expose Workflow Output selection using participant names. The core rule is that `output_from`
-is an allow-list for Workflow Output, not a routing rule for every other participant output. Unselected participant
-payloads are hidden unless `intermediate_output_from` explicitly selects them as Intermediate Output.
+- `--network none` — no host or external network.
+- `--user 65534:65534` — runs as `nobody:nogroup`.
+- `--read-only` root filesystem; only mounted host paths are writable.
+- `--cap-drop ALL` and `--security-opt no-new-privileges`.
+- `--memory 512m`, `--pids-limit 256`, ephemeral `tmpfs /tmp`.
 
-- `output_from` designates participant emissions as Workflow Output (`type='output'` events).
-- `intermediate_output_from` designates participant emissions as Intermediate Output (`type='intermediate'` events).
+To expose a host directory, pass `host_workdir="/path"` (mounted
+read-only by default; `mount_readonly=False` to allow writes). Swap the
+container runtime with `docker_binary="podman"`.
 
-If neither list is provided, each builder uses its documented default Workflow Output contract. Sequential emits the
-last participant; Concurrent, GroupChat, and Magentic emit their aggregator/orchestrator/manager output; Handoff emits
-participants.
+## Sandbox tiers at a glance
 
-| Selection | Workflow Output | Intermediate Output | Hidden payloads |
-| --- | --- | --- | --- |
-| Omit both selections | Builder default Workflow Output contract | None | Builder-specific non-output participant payloads |
-| `output_from="all"` | Every output-capable participant | None | None |
-| `output_from=[writer]` | Only `writer` | None | All other participant payloads |
-| `output_from=[writer], intermediate_output_from="all_other"` | Only `writer` | Every output-capable participant not selected by `output_from` | None |
-| `intermediate_output_from="all_other"` | None, except builder-internal default output executors where applicable | Every output-capable participant | Builder-internal plumbing payloads |
-| `output_from=[], intermediate_output_from="all_other"` | None, except builder-internal default output executors where applicable | Every output-capable participant | Builder-internal plumbing payloads |
-| `output_from=[writer], intermediate_output_from=[researcher, reviewer]` | Only `writer` | `researcher` and `reviewer` | Any other participant payloads |
+| Use case | Tool | Sandbox |
+|---|---|---|
+| Run *code* (untrusted) | `HyperlightCodeActProvider.execute_code` (`agent-framework-hyperlight`) | Hyperlight WASM microVM |
+| Run *shell* (untrusted) | `DockerShellTool` | OCI container (network-off, non-root, capabilities dropped) |
+| Run *shell* (trusted dev) | `LocalShellTool` | Approval-in-the-loop |
 
-Invalid selections fail at construction or build time:
+## Relationship to `agent-framework-hyperlight`
 
-| Invalid selection | Why it fails |
-| --- | --- |
-| `output_from="all_other"` | `"all_other"` is only valid for `intermediate_output_from` |
-| `intermediate_output_from="all"` | `"all"` is only valid for `output_from` |
-| The same participant in both selections | One payload cannot be both Workflow Output and Intermediate Output |
-| Duplicate participant selections | Duplicates are treated as configuration errors |
-| Unknown participant selections | Typos and missing participants are rejected |
-| `output_from=[], intermediate_output_from=[]` | Both explicit selections are empty |
-
-When an orchestration is wrapped with `workflow.as_agent()`, Workflow Output becomes normal response text. Intermediate
-Output becomes `text_reasoning` content so callers can inspect progress without changing `.text` behavior.
-
-## Documentation
-
-For more information, see the [Agent Framework documentation](https://aka.ms/agent-framework).
+`agent-framework-hyperlight` is a **code** sandbox (a single WASM guest
+loaded into a microVM, called via a hostcall ABI — there is no kernel,
+userland, or shell binary inside). It is the right tier for executing
+generated *code*. For sandboxing *shell* commands, the realistic tier is
+OCI, which `DockerShellTool` provides.
