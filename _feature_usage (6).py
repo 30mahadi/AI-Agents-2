@@ -4,6 +4,6 @@ from enum import IntEnum
 
 
 class FeatureIndex(IntEnum):
-    """A2A hosting-owned feature-usage indexes."""
+    """MCP hosting-owned feature-usage indexes."""
 
-    HOSTING_A2A = 84
+    HOSTING_MCP = 85

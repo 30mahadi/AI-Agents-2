@@ -1,303 +1,341 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Unit tests for the State class superstep caching behavior."""
+from __future__ import annotations
+
+import asyncio
+import importlib
+from collections.abc import AsyncIterator, Awaitable, Mapping
+from typing import Any, Literal, overload
 
 import pytest
+from agent_framework import (
+    AgentResponse,
+    AgentResponseUpdate,
+    AgentRunInputs,
+    AgentSession,
+    Content,
+    Message,
+    ResponseStream,
+    SessionStore,
+    Workflow,
+)
+
+import agent_framework_hosting
+from agent_framework_hosting import AgentState, WorkflowState
+
+
+def _workflow_fixture(name: str) -> Any:
+    """Load a fixture from ``_workflow_fixtures.py`` via the ``conftest``-registered alias.
+
+    Mirrors ``test_host.py``'s helper: the local ``conftest.py`` registers
+    ``_workflow_fixtures.py`` under the collision-proof name
+    ``hosting_workflow_fixtures`` so it stays importable in both
+    package-local and aggregate pytest runs.
+    """
+    return getattr(importlib.import_module("hosting_workflow_fixtures"), name)
+
+
+class _FakeAgent:
+    """Minimal agent target for state tests.
+
+    Declares ``run`` with the same two overloads as ``SupportsAgentRun`` (one
+    per ``stream`` value) so it satisfies the protocol under static type
+    checking, not just at runtime.
+    """
+
+    id: str = "fake-agent"
+    name: str | None = "Fake Agent"
+    description: str | None = "Fake agent for tests"
+
+    def __init__(self) -> None:
+        self.created_sessions: list[AgentSession] = []
+
+    def create_session(self, *, session_id: str | None = None) -> AgentSession:
+        session = AgentSession(session_id=session_id)
+        self.created_sessions.append(session)
+        return session
+
+    def get_session(self, service_session_id: Any, *, session_id: str | None = None) -> AgentSession:
+        return AgentSession(session_id=session_id, service_session_id=service_session_id)
+
+    @overload
+    def run(
+        self,
+        messages: AgentRunInputs | None = None,
+        *,
+        stream: Literal[False] = ...,
+        session: AgentSession | None = None,
+        function_invocation_kwargs: Mapping[str, Any] | None = None,
+        client_kwargs: Mapping[str, Any] | None = None,
+    ) -> Awaitable[AgentResponse[Any]]: ...
+
+    @overload
+    def run(
+        self,
+        messages: AgentRunInputs | None = None,
+        *,
+        stream: Literal[True],
+        session: AgentSession | None = None,
+        function_invocation_kwargs: Mapping[str, Any] | None = None,
+        client_kwargs: Mapping[str, Any] | None = None,
+    ) -> ResponseStream[AgentResponseUpdate, AgentResponse[Any]]: ...
 
-from agent_framework._workflows._state import State
-
-
-class TestStateBasicOperations:
-    """Tests for basic State get/set/has/delete operations."""
-
-    def test_set_and_get(self) -> None:
-        state = State()
-        state.set("key", "value")
-        assert state.get("key") == "value"
-
-    def test_get_with_default(self) -> None:
-        state = State()
-        assert state.get("missing") is None
-        assert state.get("missing", "default") == "default"
-
-    def test_has_returns_true_for_existing_key(self) -> None:
-        state = State()
-        state.set("key", "value")
-        assert state.has("key") is True
-
-    def test_has_returns_false_for_missing_key(self) -> None:
-        state = State()
-        assert state.has("missing") is False
-
-    def test_delete_existing_key(self) -> None:
-        state = State()
-        state.set("key", "value")
-        state.commit()
-        state.delete("key")
-        state.commit()
-        assert state.has("key") is False
-        assert state.get("key") is None
-
-    def test_delete_missing_key_raises(self) -> None:
-        state = State()
-        with pytest.raises(KeyError, match="Key 'missing' not found"):
-            state.delete("missing")
-
-    def test_clear(self) -> None:
-        state = State()
-        state.set("key1", "value1")
-        state.commit()
-        state.set("key2", "value2")
-        state.clear()
-        assert state.get("key1") is None
-        assert state.get("key2") is None
-
-
-class TestSuperstepCaching:
-    """Tests for superstep caching semantics - pending vs committed state."""
-
-    def test_set_writes_to_pending_not_committed(self) -> None:
-        state = State()
-        state.set("key", "value")
-
-        # Value is in pending
-        assert "key" in state._pending  # pyright: ignore[reportPrivateUsage]
-        # Value is NOT in committed
-        assert "key" not in state._committed  # pyright: ignore[reportPrivateUsage]
-        # But get() still returns it
-        assert state.get("key") == "value"
-
-    def test_commit_moves_pending_to_committed(self) -> None:
-        state = State()
-        state.set("key", "value")
-
-        # Before commit: in pending, not committed
-        assert "key" in state._pending  # pyright: ignore[reportPrivateUsage]
-        assert "key" not in state._committed  # pyright: ignore[reportPrivateUsage]
-
-        state.commit()
-
-        # After commit: in committed, pending cleared
-        assert "key" not in state._pending  # pyright: ignore[reportPrivateUsage]
-        assert "key" in state._committed  # pyright: ignore[reportPrivateUsage]
-        assert state.get("key") == "value"
-
-    def test_discard_clears_pending_without_committing(self) -> None:
-        state = State()
-        state.set("existing", "original")
-        state.commit()
-
-        # Make a pending change
-        state.set("existing", "modified")
-        state.set("new_key", "new_value")
-
-        # Discard pending changes
-        state.discard()
-
-        # Original value is preserved, new key never committed
-        assert state.get("existing") == "original"
-        assert state.get("new_key") is None
-
-    def test_pending_overrides_committed_on_get(self) -> None:
-        state = State()
-        state.set("key", "committed_value")
-        state.commit()
-
-        state.set("key", "pending_value")
-
-        # get() returns pending value, not committed
-        assert state.get("key") == "pending_value"
-        # But committed still has old value
-        assert state._committed["key"] == "committed_value"  # pyright: ignore[reportPrivateUsage]
-
-    def test_multiple_sets_before_commit(self) -> None:
-        state = State()
-        state.set("key", "value1")
-        state.set("key", "value2")
-        state.set("key", "value3")
-
-        # Only final value is in pending
-        assert state.get("key") == "value3"
-
-        state.commit()
-        assert state.get("key") == "value3"
-
-
-class TestDeleteWithSuperstepCaching:
-    """Tests for delete behavior with superstep caching."""
-
-    def test_delete_pending_only_key(self) -> None:
-        state = State()
-        state.set("key", "value")
-        # Key only in pending, not committed
-        assert "key" in state._pending  # pyright: ignore[reportPrivateUsage]
-        assert "key" not in state._committed  # pyright: ignore[reportPrivateUsage]
-
-        state.delete("key")
-
-        # Should be removed from pending
-        assert "key" not in state._pending  # pyright: ignore[reportPrivateUsage]
-        assert state.get("key") is None
-        assert state.has("key") is False
-
-    def test_delete_committed_key_marks_for_deletion(self) -> None:
-        state = State()
-        state.set("key", "value")
-        state.commit()
-
-        state.delete("key")
-
-        # Key should be marked for deletion in pending (sentinel)
-        assert "key" in state._pending  # pyright: ignore[reportPrivateUsage]
-        # get() should return default (not the sentinel!)
-        assert state.get("key") is None
-        assert state.get("key", "default") == "default"
-        # has() should return False
-        assert state.has("key") is False
-        # But committed still has it until commit()
-        assert "key" in state._committed  # pyright: ignore[reportPrivateUsage]
-
-    def test_delete_committed_key_removed_on_commit(self) -> None:
-        state = State()
-        state.set("key", "value")
-        state.commit()
-
-        state.delete("key")
-        state.commit()
-
-        # Now it should be gone from committed too
-        assert "key" not in state._committed  # pyright: ignore[reportPrivateUsage]
-        assert "key" not in state._pending  # pyright: ignore[reportPrivateUsage]
-
-    def test_delete_key_in_both_pending_and_committed(self) -> None:
-        """Test delete when key exists in both pending (modified) and committed."""
-        state = State()
-        state.set("key", "original")
-        state.commit()
-
-        # Modify the key (now in both pending and committed)
-        state.set("key", "modified")
-        assert state._pending["key"] == "modified"  # pyright: ignore[reportPrivateUsage]
-        assert state._committed["key"] == "original"  # pyright: ignore[reportPrivateUsage]
-
-        # Delete should mark for deletion from committed
-        state.delete("key")
-
-        # Should be marked for deletion
-        assert state.get("key") is None
-        assert state.has("key") is False
-
-        # After commit, key should be fully removed
-        state.commit()
-        assert "key" not in state._committed  # pyright: ignore[reportPrivateUsage]
-        assert "key" not in state._pending  # pyright: ignore[reportPrivateUsage]
-
-    def test_discard_after_delete_restores_committed_value(self) -> None:
-        state = State()
-        state.set("key", "value")
-        state.commit()
-
-        state.delete("key")
-        # Key appears deleted
-        assert state.has("key") is False
-
-        state.discard()
-        # After discard, committed value is restored
-        assert state.has("key") is True
-        assert state.get("key") == "value"
-
-
-class TestFailureScenarios:
-    """Tests simulating failure scenarios - pending changes should not leak to committed."""
-
-    def test_failure_before_commit_preserves_committed_state(self) -> None:
-        """Simulate executor failure - pending changes should not affect committed state."""
-        state = State()
-        state.set("key1", "original1")
-        state.set("key2", "original2")
-        state.commit()
-
-        # Superstep starts - make some changes
-        state.set("key1", "modified1")
-        state.set("key3", "new_value")
-        state.delete("key2")
-
-        # Simulate failure - we call discard() instead of commit()
-        state.discard()
-
-        # All original values should be intact
-        assert state.get("key1") == "original1"
-        assert state.get("key2") == "original2"
-        assert state.get("key3") is None
-
-    def test_no_partial_commits(self) -> None:
-        """Ensure commit is atomic - either all changes apply or none."""
-        state = State()
-        state.set("key1", "value1")
-        state.set("key2", "value2")
-        state.set("key3", "value3")
-
-        # Before commit - nothing in committed
-        assert len(state._committed) == 0  # pyright: ignore[reportPrivateUsage]
-
-        state.commit()
-
-        # After commit - all three values committed together
-        assert state._committed == {"key1": "value1", "key2": "value2", "key3": "value3"}  # pyright: ignore[reportPrivateUsage]
-
-    def test_repeated_supersteps_are_isolated(self) -> None:
-        """Test that each superstep's changes are isolated until committed."""
-        state = State()
-
-        # Superstep 1
-        state.set("counter", 1)
-        state.commit()
-        assert state.get("counter") == 1
-
-        # Superstep 2
-        state.set("counter", 2)
-        state.set("temp", "should_be_discarded")
-        state.discard()  # Simulate failure
-        assert state.get("counter") == 1  # Reverted to superstep 1 value
-        assert state.get("temp") is None
-
-        # Superstep 3
-        state.set("counter", 3)
-        state.commit()
-        assert state.get("counter") == 3
-
-
-class TestExportImport:
-    """Tests for state serialization (export/import)."""
-
-    def test_export_returns_committed_only(self) -> None:
-        state = State()
-        state.set("committed_key", "committed_value")
-        state.commit()
-        state.set("pending_key", "pending_value")
-
-        exported = state.export_state()
-
-        # Only committed state is exported
-        assert exported == {"committed_key": "committed_value"}
-        assert "pending_key" not in exported
-
-    def test_import_merges_into_committed(self) -> None:
-        state = State()
-        state.set("existing", "original")
-        state.commit()
-
-        state.import_state({"imported": "value", "existing": "overwritten"})
-
-        assert state.get("imported") == "value"
-        assert state.get("existing") == "overwritten"
-
-    def test_import_does_not_affect_pending(self) -> None:
-        state = State()
-        state.set("pending_key", "pending_value")
-
-        state.import_state({"imported": "value"})
-
-        # Pending is still there
-        assert state.get("pending_key") == "pending_value"
-        assert "pending_key" in state._pending  # pyright: ignore[reportPrivateUsage]
+    def run(
+        self,
+        messages: AgentRunInputs | None = None,
+        *,
+        stream: bool = False,
+        session: AgentSession | None = None,
+        function_invocation_kwargs: Mapping[str, Any] | None = None,
+        client_kwargs: Mapping[str, Any] | None = None,
+    ) -> Awaitable[AgentResponse[Any]] | ResponseStream[AgentResponseUpdate, AgentResponse[Any]]:
+        if stream:
+
+            async def _stream() -> AsyncIterator[AgentResponseUpdate]:
+                yield AgentResponseUpdate(contents=[Content.from_text(text="ok")], role="assistant")
+
+            return ResponseStream(_stream(), finalizer=lambda updates: AgentResponse.from_updates(updates))
+
+        async def _get_response() -> AgentResponse[Any]:
+            return AgentResponse(messages=Message(role="assistant", contents=[Content.from_text(text="ok")]))
+
+        return _get_response()
+
+
+class TestAgentState:
+    def test_session_store_is_owned_by_core(self) -> None:
+        assert "SessionStore" not in agent_framework_hosting.__all__
+        assert not hasattr(agent_framework_hosting, "SessionStore")
+
+    def test_default_session_store_is_fresh_in_memory_store(self) -> None:
+        agent = _FakeAgent()
+        state = AgentState(agent)
+
+        assert state.target is agent
+        assert isinstance(state.session_store, SessionStore)
+
+    def test_accepts_session_store_instance(self) -> None:
+        store = SessionStore()
+        state = AgentState(_FakeAgent(), session_store=store)
+
+        assert state.session_store is store
+
+    async def test_callable_target_cached_by_default(self) -> None:
+        calls = 0
+
+        def create_agent() -> _FakeAgent:
+            nonlocal calls
+            calls += 1
+            return _FakeAgent()
+
+        state = AgentState(create_agent)
+
+        first = await state.get_target()
+        second = await state.get_target()
+
+        assert first is second
+        assert calls == 1
+
+    async def test_callable_target_cache_can_be_disabled(self) -> None:
+        calls = 0
+
+        def create_agent() -> _FakeAgent:
+            nonlocal calls
+            calls += 1
+            return _FakeAgent()
+
+        state = AgentState(create_agent, cache_target=False)
+
+        first = await state.get_target()
+        second = await state.get_target()
+
+        assert first is not second
+        assert calls == 2
+
+    async def test_async_callable_target(self) -> None:
+        async def create_agent() -> _FakeAgent:
+            return _FakeAgent()
+
+        state = AgentState(create_agent)
+
+        assert isinstance(await state.get_target(), _FakeAgent)
+
+    async def test_bare_awaitable_target_is_awaited_once_for_concurrent_callers(self) -> None:
+        calls = 0
+
+        async def create_agent() -> _FakeAgent:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0)
+            return _FakeAgent()
+
+        state = AgentState(create_agent())
+
+        first, second = await asyncio.gather(state.get_target(), state.get_target())
+
+        assert first is second
+        assert calls == 1
+
+    def test_cache_target_false_rejects_bare_awaitable(self) -> None:
+        async def create_agent() -> _FakeAgent:
+            return _FakeAgent()
+
+        coro = create_agent()
+        try:
+            with pytest.raises(ValueError, match="cache_target=False"):
+                AgentState(coro, cache_target=False)
+        finally:
+            coro.close()
+
+    async def test_get_or_create_session_creates_and_stores_once(self) -> None:
+        agent = _FakeAgent()
+        state = AgentState(agent)
+
+        first = await state.get_or_create_session("session-1")
+        second = await state.get_or_create_session("session-1")
+
+        assert first is not second
+        assert first.session_id == "session-1"
+        assert second.session_id == "session-1"
+        assert len(agent.created_sessions) == 1
+
+    @pytest.mark.parametrize("session_id", ["two words", "tenant/user", "tenant:conversation", "' OR 1=1 --"])
+    async def test_get_or_create_session_passes_opaque_id_to_store(self, session_id: str) -> None:
+        class _RecordingSessionStore(SessionStore):
+            def __init__(self) -> None:
+                super().__init__()
+                self.keys: list[str] = []
+
+            async def get(self, session_id: str) -> AgentSession | None:
+                self.keys.append(session_id)
+                return await super().get(session_id)
+
+            async def set(self, session_id: str, session: AgentSession) -> None:
+                self.keys.append(session_id)
+                await super().set(session_id, session)
+
+        agent = _FakeAgent()
+        store = _RecordingSessionStore()
+        state = AgentState(agent, session_store=store)
+
+        session = await state.get_or_create_session(session_id)
+
+        assert session.session_id == session_id
+        assert len(agent.created_sessions) == 1
+        assert len(set(store.keys)) == 1
+        assert store.keys[0] == session_id
+
+    async def test_get_or_create_session_rejects_empty_id(self) -> None:
+        agent = _FakeAgent()
+        state = AgentState(agent)
+
+        with pytest.raises(ValueError, match="non-empty"):
+            await state.get_or_create_session("")
+
+        assert agent.created_sessions == []
+
+    async def test_get_or_create_session_creates_once_for_concurrent_callers(self) -> None:
+        class _YieldingSessionStore(SessionStore):
+            async def get(self, session_id: str) -> AgentSession | None:
+                await asyncio.sleep(0)
+                return await super().get(session_id)
+
+            async def set(self, session_id: str, session: AgentSession) -> None:
+                await asyncio.sleep(0)
+                await super().set(session_id, session)
+
+        agent = _FakeAgent()
+        state = AgentState(agent, session_store=_YieldingSessionStore())
+
+        sessions = await asyncio.gather(*(state.get_or_create_session("session-1") for _ in range(20)))
+
+        assert len({id(session) for session in sessions}) == len(sessions)
+        assert all(session.session_id == "session-1" for session in sessions)
+        assert len(agent.created_sessions) == 1
+
+    async def test_get_or_create_session_reuses_a_session_set_on_the_state(self) -> None:
+        agent = _FakeAgent()
+        state = AgentState(agent)
+        pre_existing = AgentSession(session_id="session-1")
+        await state.set_session("session-1", pre_existing)
+
+        session = await state.get_or_create_session("session-1")
+
+        assert session is not pre_existing
+        assert session.session_id == pre_existing.session_id
+        assert len(agent.created_sessions) == 0
+
+
+class TestWorkflowState:
+    def test_accepts_workflow_target_instance(self) -> None:
+        workflow = _workflow_fixture("build_echo_workflow")()
+        state: WorkflowState[Workflow] = WorkflowState(workflow)
+
+        assert state.target is workflow
+
+    async def test_workflow_target_resolved_from_factory(self) -> None:
+        build_echo_workflow = _workflow_fixture("build_echo_workflow")
+
+        state: WorkflowState[Workflow] = WorkflowState(build_echo_workflow)
+
+        target = await state.get_target()
+        assert isinstance(target, Workflow)
+
+    async def test_bare_awaitable_workflow_target_is_awaited_once_for_concurrent_callers(self) -> None:
+        calls = 0
+
+        async def create_workflow() -> Workflow:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0)
+            return _workflow_fixture("build_echo_workflow")()
+
+        state: WorkflowState[Workflow] = WorkflowState(create_workflow())
+
+        first, second = await asyncio.gather(state.get_target(), state.get_target())
+
+        assert first is second
+        assert calls == 1
+
+    async def test_accepts_workflow_builder_instance_directly(self) -> None:
+        """A ``WorkflowBuilder`` is not itself callable or awaitable; the state must
+        recognize its `build()` method and call it, not cache the raw builder."""
+        builder = _workflow_fixture("echo_workflow_builder")()
+
+        state: WorkflowState[Workflow] = WorkflowState(builder)
+
+        target = await state.get_target()
+        assert isinstance(target, Workflow)
+        assert state.target is target
+
+    async def test_workflow_builder_is_built_once_and_cached_by_default(self) -> None:
+        builder = _workflow_fixture("echo_workflow_builder")()
+        state: WorkflowState[Workflow] = WorkflowState(builder)
+
+        first = await state.get_target()
+        second = await state.get_target()
+
+        assert first is second
+
+    async def test_workflow_builder_returns_fresh_targets_when_cache_disabled(self) -> None:
+        builder = _workflow_fixture("echo_workflow_builder")()
+        state: WorkflowState[Workflow] = WorkflowState(builder, cache_target=False)
+
+        first = await state.get_target()
+        second = await state.get_target()
+
+        assert first is not second
+
+    async def test_accepts_orchestration_style_builder_without_importing_orchestrations(self) -> None:
+        """``SupportsBuild`` is structural: any object with a zero-arg ``build() -> Workflow``
+        is accepted, matching ``agent_framework_orchestrations``' builders without this
+        package depending on that one."""
+        workflow = _workflow_fixture("build_echo_workflow")()
+
+        class _FakeOrchestrationBuilder:
+            def build(self) -> Workflow:
+                return workflow
+
+        state: WorkflowState[Workflow] = WorkflowState(_FakeOrchestrationBuilder())
+
+        assert await state.get_target() is workflow
