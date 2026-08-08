@@ -1,102 +1,96 @@
-# local_responses — Responses helpers with native FastAPI routes
+# AG-UI Single Agent Demo
 
-The smallest end-to-end Responses hosting shape: one Foundry agent with a
-`@tool`, one native FastAPI route, core's experimental `SessionStore`, and the
-Responses helper functions:
+The simplest possible AG-UI integration: a **single chat agent** with **no tools** and **no context providers**,
+served over the AG-UI protocol and consumed by a small React client.
 
-- `responses_to_run(...)`
-- `responses_session_id(...)`
-- `create_response_id(...)`
-- `responses_from_run(...)`
+Use this sample as the starting point for AG-UI. For a richer, multi-agent example with tool-approval checkpoints
+and human-in-the-loop resumes, see [`../ag_ui_workflow_handoff`](../ag_ui_workflow_handoff/README.md).
 
-The sample demonstrates the lighter hosting direction. Agent Framework provides
-the run conversion and session-state pieces; FastAPI owns route registration,
-request bodies, response objects, and server startup.
+## Folder Layout
 
-What the route demonstrates:
+- `backend/server.py` - FastAPI + AG-UI endpoint wrapping a single `Agent`
+- `frontend/` - Vite + React AG-UI client UI
 
-- Uses an explicit request-option allowlist. This sample only allows
-  `max_tokens` and then overrides `reasoning`; all other caller-supplied
-  options, including `model`, `temperature`, `store`, `tools`, and
-  `tool_choice`, are denied by default. Your app decides the exact allowed,
-  altered, and denied options.
-- **Forces** a `reasoning` preset (`effort=medium`, `summary=auto`) on every
-  turn.
-- Produces the AF messages, options, and session id that the route passes to
-  `agent.run(...)`.
-- **Stores** each newly minted response id for response-keyed continuation,
-  via `state.set_session(response_id, session)` after `agent.run(...)` has
-  updated the session.
-  OpenAI's `previous_response_id` rotates every turn *by design* — it lets a
-  caller continue from any earlier response, not just the latest one — so
-  every response id needs to stay independently resolvable, not just the
-  most recent.
-- Treats an unknown `conversation_id` as a request to create a new local
-  session. Your app can choose a stricter policy, such as requiring a separate
-  API to create new conversations before callers can continue them.
-- Explicitly advances a supplied `conversation_id` after each completed run.
-  A conversation id is a mutable head, so only one caller should advance it at
-  a time. The sample and `AgentState` do not provide that locking; production
-  apps must serialize writers or use optimistic concurrency. These requests
-  store the updated session only under the stable conversation id.
-- Treats each `previous_response_id` as an immutable snapshot. Multiple callers
-  can branch from the same response concurrently because each receives a
-  session copy and stores its result under a newly minted response id.
-- Uses core's msgspec-backed `FileSessionStore` under
-  `storage/sessions/snapshots`.
+## Prerequisites
 
-`app:app` is a module-level FastAPI ASGI app; recommended local launch is
-Hypercorn.
+- Python 3.10+
+- Node.js 20.19+ or 22.12+
+- npm 9+
+- Azure AI project + model deployment configured in environment variables:
+  - `FOUNDRY_PROJECT_ENDPOINT`
+  - `FOUNDRY_MODEL`
+- Azure CLI authenticated with `az login`
 
-## Production readiness
+## 1) Run Backend
 
-This is not a full-fledged production deployment. Before exposing this pattern
-to callers, add authentication and authorization at the infrastructure layer,
-the FastAPI app layer, or inside the route body.
-
-Session continuation deserves particular care: treat `previous_response_id` and
-`conversation_id` as untrusted request values, authorize the caller before
-loading or storing a session for those ids, and partition any durable session
-store by tenant/user as appropriate for your application. Also coordinate
-writers for each stable `conversation_id`; this sample does not do so out of
-the box.
-
-## Run
+From the repository root:
 
 ```bash
-export FOUNDRY_PROJECT_ENDPOINT=https://<your-project>.services.ai.azure.com
-export FOUNDRY_MODEL=gpt-5-nano
-az login
-
+cd python
 uv sync
-uv run hypercorn app:app --bind 0.0.0.0:8000
+uv run python samples/05-end-to-end/ag_ui_single_agent/backend/server.py
 ```
 
-Single-process for quick iteration:
+Backend default URL:
+
+- `http://127.0.0.1:8892`
+- AG-UI endpoint: `POST http://127.0.0.1:8892/agent`
+
+To export traces to the Application Insights resource connected to the Foundry project, run the backend with:
 
 ```bash
-uv run python app.py
+ENABLE_AZURE_MONITOR=true uv run python samples/05-end-to-end/ag_ui_single_agent/backend/server.py
 ```
 
-## Call locally
+Each user turn is a separate run and trace. The stable AG-UI `thread_id` is recorded as
+`gen_ai.conversation.id`, which lets Foundry group those turns into one conversation.
+
+## 2) Install Frontend Packages (npm)
+
+From the `python/` directory (where Step 1 left you):
 
 ```bash
-uv sync --group dev
-
-# Plain OpenAI SDK call:
-uv run python call_server.py
-
-# The client intentionally omits `model`; the app chooses the backing deployment
-# from FOUNDRY_MODEL.
-
-# The script then sends two more turns, each continuing from the previous
-# turn's `response.id` as `previous_response_id`. The third turn asks about
-# the first turn's city, so it only succeeds if the server still remembers
-# that far back in the chain.
-
-# Same three-turn interaction through an Agent Framework Agent backed by
-# OpenAIChatClient:
-uv run python call_server_af.py
+cd samples/05-end-to-end/ag_ui_single_agent/frontend
+npm install
 ```
 
-> This sample is **local-only** — no Dockerfile, no Foundry packaging.
+## 3) Run Frontend Locally
+
+```bash
+npm run dev
+```
+
+Frontend default URL:
+
+- `http://127.0.0.1:5173`
+
+If you changed backend host/port, run with:
+
+```bash
+VITE_BACKEND_URL=http://127.0.0.1:8892 npm run dev
+```
+
+## 4) Demo Flow to Verify
+
+1. Click one of the starter prompts (or type your own message).
+2. Watch the assistant response stream in token by token.
+3. Send a follow-up that depends on the previous turn (for example: "summarize what you just told me").
+   The client only sends the newest message plus the `thread_id`; the server replays the stored history.
+4. Click **New Thread** to start a fresh conversation (a new `thread_id`).
+
+## Conversation History
+
+The client only ever sends the **newest message** plus a `thread_id`. The backend retains history **server-side**,
+keyed by that `thread_id`, using an `InMemoryAGUIThreadSnapshotStore`. Because an AG-UI thread id is not an
+authorization boundary, a `snapshot_scope_resolver` is required whenever a snapshot store is configured; this
+single-tenant demo maps every request to one shared `"demo"` scope.
+
+The in-memory store is process-local and not durable. Swap in your own `AGUIThreadSnapshotStore` implementation
+(and a real scope resolver) for production.
+
+## What This Validates
+
+- `add_agent_framework_fastapi_endpoint(...)` with a plain `Agent` (no `AgentFrameworkWorkflow` wrapper)
+- Streaming assistant text via `TEXT_MESSAGE_START` / `TEXT_MESSAGE_CONTENT` / `TEXT_MESSAGE_END` AG-UI events
+- Server-side conversation history keyed by `thread_id` via a snapshot store
+- Foundry trace correlation across runs using the stable AG-UI `thread_id`

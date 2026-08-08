@@ -1,35 +1,119 @@
-# Hosting Samples
+# AG-UI Handoff Workflow Demo
 
-This directory contains Python samples that demonstrate different ways to host Agent Framework agents. Use this page to choose the hosting model that best fits your scenario, then continue to the README in the relevant subdirectory.
+This demo is a full custom AG-UI application built on top of the new workflow abstractions in `agent_framework_ag_ui`.
 
-## Hosting Options
+It includes:
 
-| Option | Use this when you need... | Start here |
-|--------|----------------------------|------------|
-| A2A | Agent-to-Agent protocol interoperability or remote agent invocation. | [`a2a/README.md`](./a2a/README.md) |
-| Azure Functions | HTTP or serverless hosting on Azure Functions. | [Durable extension Azure Functions samples](https://github.com/microsoft/agent-framework-durable-extension/tree/main/python/samples/azure_functions) |
-| Durable Task | Durable execution, long-running flows, or orchestration patterns. | [Durable extension samples](https://github.com/microsoft/agent-framework-durable-extension/tree/main/python/samples) |
-| Foundry Hosted Agents | Microsoft Foundry hosted agent deployment. | [`foundry-hosted-agents/README.md`](./foundry-hosted-agents/README.md) |
-| Self-Hosted Protocol Helpers | Application-owned OpenAI Responses endpoints or Telegram bots. | [`af-hosting/README.md`](./af-hosting/README.md) |
+- A **backend** FastAPI AG-UI endpoint serving a **HandoffBuilder workflow** with:
+  - `triage_agent`
+  - `refund_agent`
+  - `order_agent`
+- Required **tool approval checkpoints**:
+  - `submit_refund` (`approval_mode="always_require"`)
+  - `submit_replacement` (`approval_mode="always_require"`)
+- A second **request-info resume** step (order agent asks for shipping preference)
+- A **frontend** React app that consumes AG-UI SSE events, renders workflow cards, and sends `resume.interrupts` payloads.
 
-## How to Choose
+The backend uses Azure OpenAI responses and supports intent-driven, non-linear handoff routing.
 
-- Start with **A2A** if you want one agent to call or expose another agent over the A2A protocol.
-- Start with the **Durable Agent Framework extension** if you need Azure Functions hosting, persistent state, durable workflows, or orchestration across multiple steps.
-- Start with **Foundry Hosted Agents** if you want to package and deploy an agent as a hosted agent in Microsoft Foundry.
-- Start with **Self-Hosted Protocol Helpers** if you want to own the web framework or native SDK, routing, authorization, and state storage while using OpenAI Responses or Telegram helpers.
+This demo keeps workflow state per `thread_id`. When the assistant ends a case with `Case complete.`, the UI blocks
+later top-level input on that same thread and asks the user to start a new case explicitly instead of resuming a
+terminated workflow.
 
-## Common Prerequisites
+## Folder Layout
 
-Most hosting samples share a small set of prerequisites:
+- `backend/server.py` - FastAPI + AG-UI endpoint + Handoff workflow
+- `frontend/` - Vite + React AG-UI client UI
 
-- A supported Python environment for running the samples locally.
-- A Microsoft Foundry project endpoint and model deployment name for `FOUNDRY_PROJECT_ENDPOINT` and `FOUNDRY_MODEL`.
-- Azure CLI authentication via `az login` when the sample uses `AzureCliCredential`.
-- Any hosting-specific tools or extra services called out in the subdirectory README.
+## Prerequisites
 
-## Next Steps
+- Python 3.10+
+- Node.js 18+
+- npm 9+
+- Azure AI project + model deployment configured in environment variables:
+  - `FOUNDRY_PROJECT_ENDPOINT`
+  - `FOUNDRY_MODEL`
 
-1. Pick the hosting approach that matches your scenario.
-2. Open the corresponding README for setup and run instructions.
-3. Follow that sample's environment, dependency, and execution steps.
+## 1) Run Backend
+
+From the Python repo root:
+
+```bash
+cd python
+uv sync
+uv run python samples/05-end-to-end/ag_ui_workflow_handoff/backend/server.py
+```
+
+Backend default URL:
+
+- `http://127.0.0.1:8891`
+- AG-UI endpoint: `POST http://127.0.0.1:8891/handoff_demo`
+
+## 2) Install Frontend Packages (npm)
+
+From the `python/` directory (where Step 1 left you):
+
+```bash
+cd samples/05-end-to-end/ag_ui_workflow_handoff/frontend
+npm install
+```
+
+## 3) Run Frontend Locally
+
+```bash
+npm run dev
+```
+
+Frontend default URL:
+
+- `http://127.0.0.1:5173`
+
+If you changed backend host/port, run with:
+
+```bash
+VITE_BACKEND_URL=http://127.0.0.1:8891 npm run dev
+```
+
+## 4) Demo Flow to Verify
+
+1. Click one of the starter prompts (or type a refund request).
+2. Refund Agent asks for an order number; reply with a numeric ID (for example: `987654`).
+3. If your initial request did not explicitly choose refund vs replacement, the agent asks a clarifying choice question.
+4. Wait for the `submit_refund` reviewer interrupt (built from your provided order ID).
+5. In the **HITL Reviewer Console** modal, click **Approve Tool Call**.
+6. If you asked for replacement, the Order agent asks for shipping preference; reply in the chat input (for example: `expedited`).
+7. When replacement is requested, wait for the `submit_replacement` reviewer interrupt and approve/reject it.
+8. If you asked for refund-only, the flow should close without replacement/shipping prompts.
+9. Confirm the case snapshot updates and workflow completion.
+10. After the case closes, another top-level message on the same thread is rejected with a notice.
+11. Click **Start New Case** to begin a fresh thread.
+
+## Important: `require_per_service_call_history_persistence`
+
+All agents participating in a handoff workflow **must** be constructed with
+`require_per_service_call_history_persistence=True`. The `HandoffBuilder` will
+raise a `ValueError` at build time if any participant is missing this flag.
+
+**Why this is required:** Handoff workflows use middleware that short-circuits
+tool calls via `MiddlewareTermination` when a handoff tool is invoked. Without
+per-service-call history persistence, local history providers would persist tool
+results that the service never received, causing call/result mismatches on
+subsequent turns.
+
+```python
+agent = Agent(
+    client=client,
+    name="my_agent",
+    require_per_service_call_history_persistence=True,  # Required for handoff
+)
+```
+
+## What This Validates
+
+- `add_agent_framework_fastapi_endpoint(...)` with `AgentFrameworkWorkflow(workflow_factory=...)`
+- Thread-scoped workflow state across turns
+- `RUN_FINISHED.interrupt` pause behavior
+- `resume.interrupts` continuation behavior
+- JSON resume payload coercion for `Content` and `list[Message]` workflow response types
+- Intent-driven routing between triage, refund, and order specialists (no forced linear path)
+- Multiple HITL approvals in one case (`submit_refund` + `submit_replacement`)

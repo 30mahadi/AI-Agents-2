@@ -1,733 +1,1063 @@
-/**
- * DevUI App - Minimal orchestrator for agent/workflow interactions
- * Features: Entity selection, layout management, debug coordination
- */
+// Copyright (c) Microsoft. All rights reserved.
 
-import { useEffect, useCallback, useRef, useState } from "react";
-import { AppHeader, DebugPanel, SettingsModal, DeploymentModal } from "@/components/layout";
-import { GalleryView } from "@/components/features/gallery";
-import { AgentView } from "@/components/features/agent";
-import { WorkflowView } from "@/components/features/workflow";
-import { Toast, ToastContainer } from "@/components/ui/toast";
-import { apiClient } from "@/services/api";
-import { PanelRightOpen, ChevronLeft, ChevronDown, ServerOff, Rocket, Lock } from "lucide-react";
-import type {
-  AgentInfo,
-  WorkflowInfo,
-  ExtendedResponseStreamEvent,
-  ResponseTextDeltaEvent,
-} from "@/types";
-import { Button } from "./components/ui/button";
-import { Input } from "./components/ui/input";
-import { useDevUIStore } from "@/stores";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
-const DEBUG_TEXT_EVENT_FLUSH_INTERVAL_MS = 50;
+type AgUiEvent = Record<string, unknown> & { type: string };
 
-export default function App() {
-  // Local state for auth handling
-  const [authRequired, setAuthRequired] = useState(false);
-  const [authToken, setAuthToken] = useState("");
-  const [isTestingToken, setIsTestingToken] = useState(false);
-  const [authError, setAuthError] = useState("");
-  const bufferedDebugTextRef = useRef<ResponseTextDeltaEvent | null>(null);
-  const lastBufferedDebugFlushAtRef = useRef(0);
+type AgentId = "triage_agent" | "refund_agent" | "order_agent";
 
-  // Entity state from Zustand
-  const agents = useDevUIStore((state) => state.agents);
-  const workflows = useDevUIStore((state) => state.workflows);
-  const entities = useDevUIStore((state) => state.entities);
-  const selectedAgent = useDevUIStore((state) => state.selectedAgent);
-  const azureDeploymentEnabled = useDevUIStore((state) => state.azureDeploymentEnabled);
-  const isLoadingEntities = useDevUIStore((state) => state.isLoadingEntities);
-  const entityError = useDevUIStore((state) => state.entityError);
+interface Interrupt {
+  id: string;
+  value: unknown;
+}
 
-  // OpenAI proxy mode
-  const oaiMode = useDevUIStore((state) => state.oaiMode);
+interface RequestInfoPayload {
+  request_id?: string;
+  source_executor_id?: string;
+  request_type?: string;
+  response_type?: string;
+  data?: unknown;
+}
 
-  // UI mode
-  const uiMode = useDevUIStore((state) => state.uiMode);
+interface DisplayMessage {
+  id: string;
+  role: "assistant" | "user" | "system";
+  text: string;
+}
 
-  // Entity actions
-  const setAgents = useDevUIStore((state) => state.setAgents);
-  const setWorkflows = useDevUIStore((state) => state.setWorkflows);
-  const setEntities = useDevUIStore((state) => state.setEntities);
-  const selectEntity = useDevUIStore((state) => state.selectEntity);
-  const updateAgent = useDevUIStore((state) => state.updateAgent);
-  const updateWorkflow = useDevUIStore((state) => state.updateWorkflow);
-  const setIsLoadingEntities = useDevUIStore((state) => state.setIsLoadingEntities);
-  const setEntityError = useDevUIStore((state) => state.setEntityError);
+interface CaseSnapshot {
+  orderId: string;
+  refundAmount: string;
+  refundApproved: "pending" | "approved" | "rejected";
+  shippingPreference: string;
+}
 
-  // UI state from Zustand
-  const showDebugPanel = useDevUIStore((state) => state.showDebugPanel);
-  const debugPanelMinimized = useDevUIStore((state) => state.debugPanelMinimized);
-  const debugPanelWidth = useDevUIStore((state) => state.debugPanelWidth);
-  const debugEvents = useDevUIStore((state) => state.debugEvents);
-  const isResizing = useDevUIStore((state) => state.isResizing);
+interface UsageDiagnostics {
+  runId: string;
+  inputTokenCount?: number;
+  outputTokenCount?: number;
+  totalTokenCount?: number;
+  recordedAt: number;
+  raw: Record<string, unknown>;
+}
 
-  // UI actions
-  const setShowDebugPanel = useDevUIStore((state) => state.setShowDebugPanel);
-  const setDebugPanelMinimized = useDevUIStore((state) => state.setDebugPanelMinimized);
-  const setDebugPanelWidth = useDevUIStore((state) => state.setDebugPanelWidth);
-  const addDebugEvent = useDevUIStore((state) => state.addDebugEvent);
-  const clearDebugEvents = useDevUIStore((state) => state.clearDebugEvents);
-  const setIsResizing = useDevUIStore((state) => state.setIsResizing);
+const KNOWN_AGENTS: AgentId[] = ["triage_agent", "refund_agent", "order_agent"];
 
-  // Modal state
-  const showAboutModal = useDevUIStore((state) => state.showAboutModal);
-  const showGallery = useDevUIStore((state) => state.showGallery);
-  const showDeployModal = useDevUIStore((state) => state.showDeployModal);
-  const showEntityNotFoundToast = useDevUIStore((state) => state.showEntityNotFoundToast);
+const AGENT_LABELS: Record<AgentId, string> = {
+  triage_agent: "Triage",
+  refund_agent: "Refund",
+  order_agent: "Order",
+};
 
-  // Modal actions
-  const setShowAboutModal = useDevUIStore((state) => state.setShowAboutModal);
-  const setShowGallery = useDevUIStore((state) => state.setShowGallery);
-  const setShowDeployModal = useDevUIStore((state) => state.setShowDeployModal);
-  const setShowEntityNotFoundToast = useDevUIStore((state) => state.setShowEntityNotFoundToast);
+const STARTER_PROMPTS = [
+  "My order 12345 arrived damaged and I need a refund.",
+  "Help me with a damaged-order refund and replacement.",
+];
 
-  // Toast state and actions
-  const toasts = useDevUIStore((state) => state.toasts);
-  const addToast = useDevUIStore((state) => state.addToast);
-  const removeToast = useDevUIStore((state) => state.removeToast);
+const DEFAULT_CASE_SNAPSHOT: CaseSnapshot = {
+  orderId: "Not captured",
+  refundAmount: "Not captured",
+  refundApproved: "pending",
+  shippingPreference: "Not selected",
+};
 
-  // Initialize app - load agents and workflows
+const CLOSED_CASE_NOTICE =
+  "This case is already complete. Start a new case to open a fresh thread for a new request.";
+
+function randomId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `id-${Math.random().toString(16).slice(2)}`;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function getValue(source: Record<string, unknown>, ...keys: string[]): unknown {
+  for (const key of keys) {
+    if (key in source) {
+      return source[key];
+    }
+  }
+  return undefined;
+}
+
+function getString(source: Record<string, unknown>, ...keys: string[]): string | undefined {
+  const value = getValue(source, ...keys);
+  return typeof value === "string" ? value : undefined;
+}
+
+function getObject(source: Record<string, unknown>, ...keys: string[]): Record<string, unknown> | undefined {
+  const value = getValue(source, ...keys);
+  return isObject(value) ? value : undefined;
+}
+
+function safeParseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function extractTextFromMessagePayload(messagePayload: unknown): string {
+  if (!isObject(messagePayload)) {
+    return "";
+  }
+
+  const directText = getString(messagePayload, "text", "content");
+  if (directText && directText.length > 0) {
+    return directText;
+  }
+
+  const contentItems = getValue(messagePayload, "contents", "content");
+  if (Array.isArray(contentItems)) {
+    const pieces: string[] = [];
+    for (const content of contentItems) {
+      if (!isObject(content)) {
+        continue;
+      }
+      if (content.type !== "text") {
+        continue;
+      }
+      const text = getString(content, "text", "content");
+      if (text) {
+        pieces.push(text);
+      }
+    }
+    return pieces.join(" ").trim();
+  }
+
+  return "";
+}
+
+function extractPromptFromInterrupt(interrupt: Interrupt, payload?: RequestInfoPayload): string {
+  const interruptValue = interrupt.value;
+  if (!isObject(interruptValue)) {
+    return "Provide the requested information to continue.";
+  }
+
+  const directPrompt = getString(interruptValue, "message", "prompt");
+  if (directPrompt && directPrompt.length > 0) {
+    return directPrompt;
+  }
+
+  if (payload && isObject(payload.data)) {
+    const agentResponse = getObject(payload.data, "agent_response", "agentResponse");
+    if (agentResponse && Array.isArray(agentResponse.messages)) {
+      const texts = agentResponse.messages
+        .map((message) => extractTextFromMessagePayload(message))
+        .filter((text) => text.length > 0);
+      if (texts.length > 0) {
+        return texts.join(" ");
+      }
+    }
+  }
+
+  const interruptAgentResponse = getObject(interruptValue, "agent_response", "agentResponse");
+  if (interruptAgentResponse && Array.isArray(interruptAgentResponse.messages)) {
+    const texts = interruptAgentResponse.messages
+      .map((message) => extractTextFromMessagePayload(message))
+      .filter((text) => text.length > 0);
+    if (texts.length > 0) {
+      return texts.join(" ");
+    }
+  }
+
+  return "Provide the requested information to continue.";
+}
+
+function extractFunctionCallFromInterrupt(interrupt: Interrupt): Record<string, unknown> | null {
+  if (!isObject(interrupt.value)) {
+    return null;
+  }
+
+  const maybeCall = getObject(interrupt.value, "function_call", "functionCall");
+  if (isObject(maybeCall)) {
+    return maybeCall;
+  }
+  return null;
+}
+
+function parseFunctionArguments(functionCall: Record<string, unknown> | null): Record<string, unknown> {
+  if (!functionCall) {
+    return {};
+  }
+
+  const rawArguments = functionCall.arguments;
+  if (isObject(rawArguments)) {
+    return rawArguments;
+  }
+  if (typeof rawArguments === "string") {
+    const parsed = safeParseJson(rawArguments);
+    if (isObject(parsed)) {
+      return parsed;
+    }
+  }
+  return {};
+}
+
+function interruptKind(interrupt: Interrupt): "approval" | "handoff_input" | "unknown" {
+  if (isObject(interrupt.value) && getString(interrupt.value, "type") === "function_approval_request") {
+    return "approval";
+  }
+  if (isObject(interrupt.value) && getObject(interrupt.value, "agent_response", "agentResponse")) {
+    return "handoff_input";
+  }
+  if (isObject(interrupt.value) && getString(interrupt.value, "message", "prompt")) {
+    return "handoff_input";
+  }
+  return "unknown";
+}
+
+function normalizeRole(role: unknown): "assistant" | "user" | "system" {
+  if (role === "user" || role === "assistant" || role === "system") {
+    return role;
+  }
+  return "assistant";
+}
+
+function normalizeTextForDedupe(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function isCaseCompleteText(text: string): boolean {
+  return text.trim().toLowerCase().endsWith("case complete.");
+}
+
+function normalizeShippingPreference(text: string): string | null {
+  const normalized = text.trim().toLowerCase();
+  if (normalized.length === 0) {
+    return null;
+  }
+
+  if (/\bstandard\b/.test(normalized)) {
+    return "standard";
+  }
+
+  if (/\b(expedited|express|overnight|priority|next[-\s]?day)\b/.test(normalized)) {
+    return "expedited";
+  }
+
+  return null;
+}
+
+function getFiniteNumber(value: unknown): number | undefined {
+  if (typeof value !== "number") {
+    return undefined;
+  }
+  if (!Number.isFinite(value)) {
+    return undefined;
+  }
+  return value;
+}
+
+function normalizeUsagePayload(value: unknown, runId: string | null): UsageDiagnostics | null {
+  if (!isObject(value)) {
+    return null;
+  }
+
+  return {
+    runId: runId ?? "unknown",
+    inputTokenCount: getFiniteNumber(value.input_token_count),
+    outputTokenCount: getFiniteNumber(value.output_token_count),
+    totalTokenCount: getFiniteNumber(value.total_token_count),
+    recordedAt: Date.now(),
+    raw: value,
+  };
+}
+
+export default function App(): JSX.Element {
+  const backendUrl = import.meta.env.VITE_BACKEND_URL ?? "http://127.0.0.1:8891";
+  const endpoint = `${backendUrl.replace(/\/$/, "")}/handoff_demo`;
+
+  const threadIdRef = useRef<string>(randomId());
+  const assistantMessageIndexRef = useRef<Record<string, number>>({});
+  const activeRunIdRef = useRef<string | null>(null);
+  const pendingUsageRef = useRef<UsageDiagnostics | null>(null);
+  const caseClosedRef = useRef<boolean>(false);
+
+  const [messages, setMessages] = useState<DisplayMessage[]>([]);
+  const [requestInfoById, setRequestInfoById] = useState<Record<string, RequestInfoPayload>>({});
+  const [pendingInterrupts, setPendingInterrupts] = useState<Interrupt[]>([]);
+  const [activeAgent, setActiveAgent] = useState<AgentId>("triage_agent");
+  const [visitedAgents, setVisitedAgents] = useState<Set<AgentId>>(new Set(["triage_agent"]));
+  const [caseSnapshot, setCaseSnapshot] = useState<CaseSnapshot>(DEFAULT_CASE_SNAPSHOT);
+  const [statusText, setStatusText] = useState<string>("Ready");
+  const [isRunning, setIsRunning] = useState<boolean>(false);
+  const [inputText, setInputText] = useState<string>("");
+  const [isApprovalModalOpen, setIsApprovalModalOpen] = useState<boolean>(false);
+  const [latestUsage, setLatestUsage] = useState<UsageDiagnostics | null>(null);
+  const [usageHistory, setUsageHistory] = useState<UsageDiagnostics[]>([]);
+  const [isCaseClosed, setIsCaseClosed] = useState<boolean>(false);
+
+  const currentInterrupt = pendingInterrupts[0];
+  const currentInterruptKind = currentInterrupt ? interruptKind(currentInterrupt) : "unknown";
+  const currentRequestInfo = currentInterrupt ? requestInfoById[currentInterrupt.id] : undefined;
+  const interruptPrompt = currentInterrupt
+    ? extractPromptFromInterrupt(currentInterrupt, currentRequestInfo)
+    : "No pending interrupt.";
+  const canStartFreshCase = !currentInterrupt && isCaseClosed;
+
+  const functionCall = currentInterrupt ? extractFunctionCallFromInterrupt(currentInterrupt) : null;
+  const functionArguments = useMemo(() => parseFunctionArguments(functionCall), [functionCall]);
+
   useEffect(() => {
-    const loadData = async () => {
-      try {
-        // Fetch server metadata first (ui_mode, capabilities, auth status)
-        const meta = await apiClient.getMeta();
+    if (currentInterruptKind === "approval") {
+      setIsApprovalModalOpen(true);
+      return;
+    }
+    setIsApprovalModalOpen(false);
+  }, [currentInterruptKind, currentInterrupt?.id]);
 
-        // Check if auth is required
-        if (meta.auth_required) {
-          setAuthRequired(true);
+  const pushMessage = (message: DisplayMessage): void => {
+    setMessages((prev) => [...prev, message]);
+  };
 
-          // If we don't have a token, stop here and show auth UI
-          if (!apiClient.getAuthToken()) {
-            setEntityError("UNAUTHORIZED");
-            setIsLoadingEntities(false);
-            return;
+  const pushSystemNotice = (text: string): void => {
+    setMessages((prev) => {
+      if (prev.length > 0 && prev[prev.length - 1]?.role === "system" && prev[prev.length - 1]?.text === text) {
+        return prev;
+      }
+      return [...prev, { id: randomId(), role: "system", text }];
+    });
+  };
+
+  const resetConversationState = (): void => {
+    threadIdRef.current = randomId();
+    assistantMessageIndexRef.current = {};
+    activeRunIdRef.current = null;
+    pendingUsageRef.current = null;
+    caseClosedRef.current = false;
+
+    setMessages([]);
+    setRequestInfoById({});
+    setPendingInterrupts([]);
+    setActiveAgent("triage_agent");
+    setVisitedAgents(new Set(["triage_agent"]));
+    setCaseSnapshot(DEFAULT_CASE_SNAPSHOT);
+    setStatusText("Ready");
+    setInputText("");
+    setIsApprovalModalOpen(false);
+    setIsCaseClosed(false);
+  };
+
+  const rebuildAssistantMessageIndex = (items: DisplayMessage[]): void => {
+    const next: Record<string, number> = {};
+    items.forEach((item, index) => {
+      if (item.role === "assistant") {
+        next[item.id] = index;
+      }
+    });
+    assistantMessageIndexRef.current = next;
+  };
+
+  const upsertAssistantStart = (messageId: string, role: unknown): void => {
+    const normalizedRole = normalizeRole(role);
+    if (normalizedRole === "user") {
+      return;
+    }
+
+    setMessages((prev) => {
+      const existingIndex = prev.findIndex((item) => item.id === messageId);
+      if (existingIndex >= 0) {
+        return prev;
+      }
+      const next: DisplayMessage[] = [...prev, { id: messageId, role: normalizedRole, text: "" }];
+      rebuildAssistantMessageIndex(next);
+      return next;
+    });
+  };
+
+  const appendAssistantDelta = (messageId: string, delta: string): void => {
+    setMessages((prev) => {
+      const index = assistantMessageIndexRef.current[messageId];
+      if (index === undefined) {
+        const next: DisplayMessage[] = [...prev, { id: messageId, role: "assistant", text: delta }];
+        rebuildAssistantMessageIndex(next);
+        return next;
+      }
+
+      const next = [...prev];
+      const existing = next[index];
+      const existingCanonical = normalizeTextForDedupe(existing.text);
+      const deltaCanonical = normalizeTextForDedupe(delta);
+      if (
+        existingCanonical.length >= 24 &&
+        deltaCanonical.length >= 24 &&
+        existingCanonical === deltaCanonical
+      ) {
+        return prev;
+      }
+      next[index] = { ...existing, text: `${existing.text}${delta}` };
+      return next;
+    });
+  };
+
+  const finalizeAssistantMessage = (messageId: string): void => {
+    setMessages((prev) => {
+      const index = assistantMessageIndexRef.current[messageId];
+      if (index === undefined) {
+        return prev;
+      }
+      const candidate = prev[index];
+      if (candidate.role === "user" || candidate.text.trim().length > 0) {
+        if (candidate.role === "assistant" && isCaseCompleteText(candidate.text)) {
+          caseClosedRef.current = true;
+          setIsCaseClosed(true);
+        }
+        return prev;
+      }
+      const next = prev.filter((item) => item.id !== messageId);
+      rebuildAssistantMessageIndex(next);
+      return next;
+    });
+  };
+
+  const updateCaseFromApprovalRequest = (payload: RequestInfoPayload): void => {
+    if (!isObject(payload.data) || getString(payload.data, "type") !== "function_approval_request") {
+      return;
+    }
+    const functionCallPayload = getObject(payload.data, "function_call", "functionCall") ?? null;
+    const functionName = functionCallPayload ? getString(functionCallPayload, "name") : undefined;
+    const args = parseFunctionArguments(functionCallPayload);
+    const replacementShippingPreference = getString(args, "shipping_preference", "shippingPreference");
+
+    setCaseSnapshot((prev) => ({
+      ...prev,
+      orderId: getString(args, "order_id", "orderId") ?? prev.orderId,
+      refundAmount: getString(args, "amount") ?? prev.refundAmount,
+      shippingPreference: replacementShippingPreference ?? prev.shippingPreference,
+      refundApproved: functionName === "submit_refund" ? "pending" : prev.refundApproved,
+    }));
+  };
+
+  const updateActiveAgent = (candidate: unknown): void => {
+    if (candidate !== "triage_agent" && candidate !== "refund_agent" && candidate !== "order_agent") {
+      return;
+    }
+
+    setActiveAgent(candidate);
+    setVisitedAgents((prev) => {
+      const next = new Set(prev);
+      next.add(candidate);
+      return next;
+    });
+  };
+
+  const handleEvent = (event: AgUiEvent): void => {
+    switch (event.type) {
+      case "RUN_STARTED":
+        if (isObject(event)) {
+          const runId = getString(event, "run_id", "runId");
+          if (runId) {
+            activeRunIdRef.current = runId;
           }
         }
+        setStatusText("Run started");
+        break;
+      case "STEP_STARTED":
+        if (isObject(event)) {
+          const stepName = getString(event, "step_name", "stepName", "name");
+          if (stepName) {
+            updateActiveAgent(stepName);
+            setStatusText(`Running ${stepName}`);
+          }
+        }
+        break;
+      case "TEXT_MESSAGE_START":
+        if (isObject(event)) {
+          const messageId = getString(event, "message_id", "messageId");
+          if (messageId) {
+            upsertAssistantStart(messageId, event.role);
+          }
+        }
+        break;
+      case "TEXT_MESSAGE_CONTENT":
+        if (isObject(event)) {
+          const messageId = getString(event, "message_id", "messageId");
+          const delta = getString(event, "delta");
+          if (messageId && delta) {
+            appendAssistantDelta(messageId, delta);
+          }
+        }
+        break;
+      case "TEXT_MESSAGE_END":
+        if (isObject(event)) {
+          const messageId = getString(event, "message_id", "messageId");
+          if (messageId) {
+            finalizeAssistantMessage(messageId);
+          }
+        }
+        break;
+      case "MESSAGES_SNAPSHOT":
+        // Intentionally ignored for chat rendering in this demo.
+        // AG-UI snapshots can contain full conversation history and cause replay duplication.
+        break;
+      case "TOOL_CALL_ARGS": {
+        if (!isObject(event)) {
+          break;
+        }
 
-        useDevUIStore.getState().setServerMeta({
-          uiMode: meta.ui_mode,
-          runtime: meta.runtime,
-          capabilities: meta.capabilities,
-          authRequired: meta.auth_required,
-          version: meta.version,
+        const toolCallId = getString(event, "tool_call_id", "toolCallId");
+        const deltaRaw = getValue(event, "delta");
+        if (!toolCallId) {
+          break;
+        }
+
+        const parsed =
+          typeof deltaRaw === "string"
+            ? safeParseJson(deltaRaw)
+            : isObject(deltaRaw)
+              ? deltaRaw
+              : null;
+        if (!isObject(parsed)) {
+          break;
+        }
+
+        const payload: RequestInfoPayload = {
+          request_id: getString(parsed, "request_id", "requestId"),
+          source_executor_id: getString(parsed, "source_executor_id", "sourceExecutorId"),
+          request_type: getString(parsed, "request_type", "requestType"),
+          response_type: getString(parsed, "response_type", "responseType"),
+          data: getValue(parsed, "data"),
+        };
+
+        setRequestInfoById((prev) => ({
+          ...prev,
+          [toolCallId]: payload,
+        }));
+
+        updateCaseFromApprovalRequest(payload);
+        updateActiveAgent(payload.source_executor_id);
+        break;
+      }
+      case "TOOL_CALL_RESULT":
+        if (isObject(event)) {
+          const rawContent = getValue(event, "content");
+          const parsed =
+            typeof rawContent === "string"
+              ? safeParseJson(rawContent)
+              : isObject(rawContent)
+                ? rawContent
+                : null;
+          if (isObject(parsed)) {
+            updateActiveAgent(getString(parsed, "handoff_to", "handoffTo"));
+          }
+        }
+        break;
+      case "CUSTOM":
+        if (isObject(event) && getString(event, "name") === "usage") {
+          const usage = normalizeUsagePayload(getValue(event, "value"), activeRunIdRef.current);
+          if (usage) {
+            pendingUsageRef.current = usage;
+          }
+        }
+        break;
+      case "RUN_ERROR":
+        setMessages((prev) => {
+          const text = `Run error: ${isObject(event) ? (getString(event, "message") ?? "Unknown error") : "Unknown error"}`;
+          if (prev.length > 0 && prev[prev.length - 1]?.role === "system" && prev[prev.length - 1]?.text === text) {
+            return prev;
+          }
+          return [...prev, { id: randomId(), role: "system", text }];
         });
-
-        // Single API call instead of two parallel calls to same endpoint
-        const { entities: allEntities, agents: agentList, workflows: workflowList } = await apiClient.getEntities();
-
-        setEntities(allEntities);
-        setAgents(agentList);
-        setWorkflows(workflowList);
-
-        // Check if there's an entity_id in the URL
-        const urlParams = new URLSearchParams(window.location.search);
-        const entityId = urlParams.get("entity_id");
-
-        let selectedEntity: AgentInfo | WorkflowInfo | undefined;
-
-        // Try to find entity from URL parameter first
-        if (entityId) {
-          selectedEntity = allEntities.find((e) => e.id === entityId);
-
-          // If entity not found but was requested, show notification
-          if (!selectedEntity) {
-            setShowEntityNotFoundToast(true);
-          }
+        setStatusText("Run failed");
+        setIsRunning(false);
+        pendingUsageRef.current = null;
+        break;
+      case "RUN_FINISHED": {
+        const usage = pendingUsageRef.current;
+        if (usage) {
+          setLatestUsage(usage);
+          setUsageHistory((prev) => [usage, ...prev].slice(0, 6));
+          pendingUsageRef.current = null;
         }
 
-        // Fallback to first available entity if URL entity not found
-        if (!selectedEntity) {
-          // Use the first entity from the backend's original order
-          // This respects the backend's intended display order
-          selectedEntity = allEntities.length > 0 ? allEntities[0] : undefined;
+        const rawInterrupts = isObject(event) ? getValue(event, "interrupt", "interrupts") : undefined;
+        const interruptPayload = Array.isArray(rawInterrupts)
+          ? rawInterrupts
+              .filter((item): item is Record<string, unknown> => isObject(item))
+              .map((item) => ({
+                id: String(item.id ?? ""),
+                value: item.value,
+              }))
+              .filter((item) => item.id.length > 0)
+          : [];
 
-          // Update URL to match actual selected entity (or clear if none)
-          if (selectedEntity) {
-            const url = new URL(window.location.href);
-            url.searchParams.set("entity_id", selectedEntity.id);
-            window.history.replaceState({}, "", url);
-          } else {
-            // Clear entity_id if no entities available
-            const url = new URL(window.location.href);
-            url.searchParams.delete("entity_id");
-            window.history.replaceState({}, "", url);
+        for (const interrupt of interruptPayload) {
+          if (!isObject(interrupt.value)) {
+            continue;
           }
-        }
 
-        if (selectedEntity) {
-          selectEntity(selectedEntity);
+          updateCaseFromApprovalRequest({ data: interrupt.value });
 
-          // Load full info for the first entity immediately
-          if (selectedEntity.metadata?.lazy_loaded === false) {
-            try {
-              if (selectedEntity.type === "agent") {
-                const fullAgent = await apiClient.getAgentInfo(
-                  selectedEntity.id
-                );
-                updateAgent(fullAgent);
-              } else {
-                const fullWorkflow = await apiClient.getWorkflowInfo(
-                  selectedEntity.id
-                );
-                updateWorkflow(fullWorkflow);
-              }
-            } catch (error) {
-              console.error(
-                `Failed to load full info for first entity ${selectedEntity.id}:`,
-                error
-              );
-              // Show toast for entity load errors (don't use setEntityError - that kills the whole UI)
-              const errorMessage = error instanceof Error ? error.message : String(error);
-              addToast({
-                type: "error",
-                message: `Failed to load "${selectedEntity.id}": ${errorMessage}`,
-              });
+          const sourceExecutor = getString(interrupt.value, "source_executor_id", "sourceExecutorId");
+          if (sourceExecutor) {
+            updateActiveAgent(sourceExecutor);
+          }
+
+          const agentResponse = getObject(interrupt.value, "agent_response", "agentResponse");
+          if (agentResponse && Array.isArray(agentResponse.messages)) {
+            const lastMessage = [...agentResponse.messages].reverse().find(isObject);
+            if (lastMessage) {
+              updateActiveAgent(getString(lastMessage, "author_name", "authorName"));
             }
           }
         }
 
-        setIsLoadingEntities(false);
-      } catch (error) {
-        console.error("Failed to load agents/workflows:", error);
-        const errorMessage = error instanceof Error ? error.message : "Failed to load data";
+        setPendingInterrupts(interruptPayload);
+        setStatusText(
+          interruptPayload.length > 0 ? "Waiting for input" : caseClosedRef.current ? "Case complete" : "Run complete"
+        );
+        setIsRunning(false);
+        break;
+      }
+      default:
+        break;
+    }
+  };
 
-        // Check if this is an auth error
-        if (errorMessage === "UNAUTHORIZED") {
-          setAuthRequired(true);
-        }
+  const streamRun = async (body: Record<string, unknown>): Promise<void> => {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      },
+      body: JSON.stringify(body),
+    });
 
-        setEntityError(errorMessage);
-        setIsLoadingEntities(false);
+    if (!response.ok || !response.body) {
+      throw new Error(`Request failed: ${response.status}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    const processSseChunk = (rawChunk: string): void => {
+      const dataLines = rawChunk
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim());
+
+      if (dataLines.length === 0) {
+        return;
+      }
+
+      const payload = dataLines.join("\n");
+      const parsed = safeParseJson(payload);
+      if (isObject(parsed) && typeof parsed.type === "string") {
+        handleEvent(parsed as AgUiEvent);
       }
     };
 
-    loadData();
-  }, [setAgents, setWorkflows, selectEntity, updateAgent, updateWorkflow, setIsLoadingEntities, setEntityError, setShowEntityNotFoundToast, addToast, setEntities]);
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
 
-  // Handle auth token submission
-  const handleAuthTokenSubmit = useCallback(async () => {
-    if (!authToken.trim()) return;
+      buffer += decoder.decode(value, { stream: true });
 
-    setIsTestingToken(true);
-    setAuthError("");
+      while (true) {
+        const boundaryIndex = buffer.indexOf("\n\n");
+        if (boundaryIndex < 0) {
+          break;
+        }
+
+        const rawEvent = buffer.slice(0, boundaryIndex);
+        buffer = buffer.slice(boundaryIndex + 2);
+        processSseChunk(rawEvent);
+      }
+    }
+
+    const tail = buffer.trim();
+    if (tail.length > 0) {
+      processSseChunk(tail);
+    }
+  };
+
+  const runWithPayload = async (payload: Record<string, unknown>): Promise<void> => {
+    activeRunIdRef.current = typeof payload.run_id === "string" ? payload.run_id : null;
+    pendingUsageRef.current = null;
+    setIsRunning(true);
+    setStatusText("Connecting");
 
     try {
-      // Set token in API client (stores in localStorage)
-      apiClient.setAuthToken(authToken.trim());
-
-      // Test the token with an actual PROTECTED endpoint (not /meta which is public)
-      await apiClient.getEntities();
-
-      // If successful, reload to initialize with new token
-      window.location.reload();
+      await streamRun(payload);
     } catch (error) {
-      // Token is invalid - clear it and show error
-      apiClient.clearAuthToken();
-      setIsTestingToken(false);
-
-      const errorMsg = error instanceof Error ? error.message : "Unknown error";
-      if (errorMsg === "UNAUTHORIZED") {
-        setAuthError("Invalid token. Please check and try again.");
-      } else {
-        setAuthError(`Failed to connect: ${errorMsg}`);
-      }
+      const message = error instanceof Error ? error.message : "Unknown error";
+      pushMessage({ id: randomId(), role: "system", text: `Network error: ${message}` });
+      setStatusText("Network error");
+      setIsRunning(false);
     }
-  }, [authToken]);
+  };
 
-  // Auto-switch from workflow to agent when OpenAI proxy mode is enabled
-  useEffect(() => {
-    if (oaiMode.enabled && selectedAgent?.type === "workflow") {
-      // Workflows don't work with OpenAI proxy - switch to first available agent
-      const firstAgent = agents[0];
-      if (firstAgent) {
-        selectEntity(firstAgent);
-      }
-    }
-  }, [oaiMode.enabled, selectedAgent, agents, selectEntity]);
-
-  // Handle resize drag
-  const handleMouseDown = useCallback(
-    (e: React.MouseEvent) => {
-      e.preventDefault();
-      setIsResizing(true);
-
-      const startX = e.clientX;
-      const startWidth = debugPanelWidth;
-
-      const handleMouseMove = (e: MouseEvent) => {
-        const deltaX = startX - e.clientX; // Subtract because we're dragging from right
-        const newWidth = Math.max(
-          200,
-          Math.min(window.innerWidth * 0.5, startWidth + deltaX)
-        );
-        setDebugPanelWidth(newWidth);
-      };
-
-      const handleMouseUp = () => {
-        setIsResizing(false);
-        document.removeEventListener("mousemove", handleMouseMove);
-        document.removeEventListener("mouseup", handleMouseUp);
-      };
-
-      document.addEventListener("mousemove", handleMouseMove);
-      document.addEventListener("mouseup", handleMouseUp);
-    },
-    [debugPanelWidth]
-  );
-
-  // Handle entity selection - uses Zustand's selectEntity which handles ALL side effects
-  const handleEntitySelect = useCallback(
-    async (item: AgentInfo | WorkflowInfo) => {
-      selectEntity(item); // This clears conversation state, debug events, and updates URL!
-
-      // If entity is sparse (not fully loaded), load full details
-      if (item.metadata?.lazy_loaded === false) {
-        try {
-          if (item.type === "agent") {
-            const fullAgent = await apiClient.getAgentInfo(item.id);
-            updateAgent(fullAgent);
-          } else {
-            const fullWorkflow = await apiClient.getWorkflowInfo(item.id);
-            updateWorkflow(fullWorkflow);
-          }
-        } catch (error) {
-          console.error(`Failed to load full info for ${item.id}:`, error);
-          // Show toast for entity load errors (don't use setEntityError - that kills the whole UI)
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          addToast({
-            type: "error",
-            message: `Failed to load "${item.id}": ${errorMessage}`,
-          });
-        }
-      }
-    },
-    [selectEntity, updateAgent, updateWorkflow, addToast]
-  );
-
-  const flushBufferedDebugText = useCallback(() => {
-    const bufferedEvent = bufferedDebugTextRef.current;
-    if (!bufferedEvent) {
+  const startNewTurn = async (text: string): Promise<void> => {
+    if (caseClosedRef.current && pendingInterrupts.length === 0) {
+      pushSystemNotice(CLOSED_CASE_NOTICE);
+      setStatusText("Case complete");
       return;
     }
 
-    bufferedDebugTextRef.current = null;
-    lastBufferedDebugFlushAtRef.current = performance.now();
-    addDebugEvent(bufferedEvent);
-  }, [addDebugEvent]);
+    pushMessage({ id: randomId(), role: "user", text });
 
-  // Handle debug events from active view
-  const handleDebugEvent = useCallback(
-    (event: ExtendedResponseStreamEvent | "clear") => {
-      if (event === "clear") {
-        bufferedDebugTextRef.current = null;
-        clearDebugEvents();
-        return;
-      }
+    await runWithPayload({
+      thread_id: threadIdRef.current,
+      run_id: randomId(),
+      messages: [{ role: "user", content: text }],
+    });
+  };
 
-      if (
-        event.type === "response.output_text.delta" &&
-        "delta" in event &&
-        typeof event.delta === "string" &&
-        event.delta.length > 0
-      ) {
-        const bufferedEvent = bufferedDebugTextRef.current;
-        const isSameOutput =
-          bufferedEvent !== null &&
-          bufferedEvent.item_id === event.item_id &&
-          bufferedEvent.output_index === event.output_index &&
-          bufferedEvent.content_index === event.content_index;
-
-        if (isSameOutput && bufferedEvent) {
-          bufferedDebugTextRef.current = {
-            ...bufferedEvent,
-            delta: bufferedEvent.delta + event.delta,
-            sequence_number: event.sequence_number ?? bufferedEvent.sequence_number,
-          };
-        } else {
-          flushBufferedDebugText();
-          bufferedDebugTextRef.current = { ...event } as ResponseTextDeltaEvent;
-        }
-
-        if (
-          performance.now() - lastBufferedDebugFlushAtRef.current >=
-          DEBUG_TEXT_EVENT_FLUSH_INTERVAL_MS
-        ) {
-          flushBufferedDebugText();
-        }
-        return;
-      }
-
-      flushBufferedDebugText();
-      addDebugEvent(event);
-    },
-    [addDebugEvent, clearDebugEvents, flushBufferedDebugText]
-  );
-
-  // Show loading state while initializing
-  if (isLoadingEntities) {
-    return (
-      <div className="h-screen flex flex-col bg-background">
-        {/* Top Bar - Skeleton */}
-        <header className="flex h-14 items-center gap-4 border-b px-4">
-          <div className="w-64 h-9 bg-muted animate-pulse rounded-md" />
-          <div className="flex items-center gap-2 ml-auto">
-            <div className="w-8 h-8 bg-muted animate-pulse rounded-md" />
-            <div className="w-8 h-8 bg-muted animate-pulse rounded-md" />
-          </div>
-        </header>
-
-        {/* Loading Content */}
-        <div className="flex-1 flex items-center justify-center">
-          <div className="text-center">
-            <div className="text-lg font-medium">Initializing DevUI...</div>
-            <div className="text-sm text-muted-foreground mt-2">Loading agents and workflows from your configuration</div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // Show error state if loading failed
-  if (entityError) {
-    const currentBackendUrl = apiClient.getBaseUrl();
-    const isAuthError = entityError === "UNAUTHORIZED" || authRequired;
-
-    // Extract port from the backend URL for the command suggestion
-    let backendPort = "8080"; // default fallback
-    try {
-      if (currentBackendUrl) {
-        const url = new URL(currentBackendUrl);
-        backendPort = url.port || (url.protocol === "https:" ? "443" : "80");
-      }
-    } catch {
-      // If URL parsing fails, keep default
+  const resumeApproval = async (approved: boolean): Promise<void> => {
+    if (!currentInterrupt || !functionCall) {
+      return;
     }
 
-    return (
-      <div className="h-screen flex flex-col bg-background">
-        <AppHeader
-          agents={[]}
-          workflows={[]}
-          entities={[]}
-          selectedItem={undefined}
-          onSelect={() => {}}
-          isLoading={false}
-          onSettingsClick={() => setShowAboutModal(true)}
-        />
+    const functionName = getString(functionCall, "name") ?? "tool_call";
 
-        {/* Error Content */}
-        <div className="flex-1 flex items-center justify-center p-8">
-          <div className="text-center space-y-6 max-w-2xl">
-            {/* Icon */}
-            <div className="flex justify-center">
-              <div className="rounded-full bg-muted p-4 animate-pulse">
-                {isAuthError ? (
-                  <Lock className="h-12 w-12 text-muted-foreground" />
-                ) : (
-                  <ServerOff className="h-12 w-12 text-muted-foreground" />
-                )}
-              </div>
-            </div>
+    if (functionName === "submit_refund") {
+      setCaseSnapshot((prev) => ({
+        ...prev,
+        refundApproved: approved ? "approved" : "rejected",
+      }));
+    }
 
-            {/* Heading */}
-            <div className="space-y-2">
-              <h2 className="text-2xl font-semibold text-foreground">
-                {isAuthError ? "Authentication Required" : "Can't Connect to Backend"}
-              </h2>
-              <p className="text-muted-foreground text-base">
-                {isAuthError
-                  ? "This backend requires a bearer token to access."
-                  : "No worries! Just start the DevUI backend server and you'll be good to go."}
-              </p>
-            </div>
+    setIsApprovalModalOpen(false);
 
-            {/* Auth Input or Command Instructions */}
-            {isAuthError ? (
-              <div className="space-y-4">
-                <div className="text-left bg-muted/50 rounded-lg p-4 space-y-3">
-                  <p className="text-sm font-medium text-foreground">
-                    Enter Authentication Token
-                  </p>
-                  <Input
-                    type="password"
-                    placeholder="Paste token from server logs"
-                    value={authToken}
-                    onChange={(e) => setAuthToken(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && !isTestingToken) {
-                        handleAuthTokenSubmit();
-                      }
-                    }}
-                    disabled={isTestingToken}
-                    className="font-mono text-sm"
-                  />
-                  <Button
-                    onClick={handleAuthTokenSubmit}
-                    disabled={!authToken.trim() || isTestingToken}
-                    className="w-full"
-                  >
-                    {isTestingToken ? "Verifying..." : "Connect"}
-                  </Button>
+    pushMessage({
+      id: randomId(),
+      role: "system",
+      text: approved ? `HITL Reviewer approved ${functionName}.` : `HITL Reviewer rejected ${functionName}.`,
+    });
 
-                  {/* Error message */}
-                  {authError && (
-                    <p className="text-sm text-red-600 dark:text-red-400 text-center">
-                      {authError}
-                    </p>
-                  )}
-                </div>
+    const approvalResponse = {
+      type: "function_approval_response",
+      approved,
+      id: String((isObject(currentInterrupt.value) && currentInterrupt.value.id) || currentInterrupt.id),
+      function_call: functionCall,
+    };
 
-                <details className="text-left group">
-                  <summary className="text-sm text-muted-foreground cursor-pointer hover:text-foreground flex items-center gap-2 justify-center">
-                    <ChevronDown className="h-4 w-4 transition-transform group-open:rotate-180" />
-                    Where do I find the token?
-                  </summary>
-                  <div className="mt-3 text-left bg-muted/30 rounded-lg p-3 space-y-2">
-                    <p className="text-xs text-muted-foreground">
-                      Look for this in your DevUI server startup logs:
-                    </p>
-                    <code className="block bg-background px-2 py-1 rounded text-xs font-mono text-foreground">
-                      🔑 DEV TOKEN (localhost only, shown once):
-                      <br />
-                      &nbsp;&nbsp; abc123xyz...
-                    </code>
-                  </div>
-                </details>
-              </div>
-            ) : (
-              <>
-                <div className="space-y-3">
-                  <div className="text-left bg-muted/50 rounded-lg p-4 space-y-3">
-                    <p className="text-sm font-medium text-foreground">
-                      Start the backend:
-                    </p>
-                    <code className="block bg-background px-3 py-2 rounded border text-sm font-mono text-foreground">
-                      devui ./agents --port {backendPort}
-                    </code>
-                    <p className="text-xs text-muted-foreground">
-                      Or launch programmatically with{" "}
-                      <code className="text-xs">serve(entities=[agent])</code>
-                    </p>
-                  </div>
+    await runWithPayload({
+      thread_id: threadIdRef.current,
+      run_id: randomId(),
+      messages: [],
+      resume: {
+        interrupts: [
+          {
+            id: currentInterrupt.id,
+            value: approvalResponse,
+          },
+        ],
+      },
+    });
+  };
 
-                  <p className="text-xs text-muted-foreground">
-                    Default:{" "}
-                    <span className="font-mono">{currentBackendUrl}</span>
-                  </p>
-                </div>
+  const resumeHandoffInput = async (text: string): Promise<void> => {
+    if (!currentInterrupt) {
+      return;
+    }
 
-                {/* Error Details (Collapsible) */}
-                {entityError && (
-                  <details className="text-left group">
-                    <summary className="text-sm text-muted-foreground cursor-pointer hover:text-foreground flex items-center gap-2">
-                      <ChevronDown className="h-4 w-4 transition-transform group-open:rotate-180" />
-                      Error details
-                    </summary>
-                    <p className="mt-2 text-xs text-muted-foreground font-mono bg-muted/30 p-3 rounded border">
-                      {entityError}
-                    </p>
-                  </details>
-                )}
+    const fromOrderAgent = currentRequestInfo?.source_executor_id === "order_agent";
+    const shippingPreference = fromOrderAgent ? normalizeShippingPreference(text) : null;
+    if (shippingPreference) {
+      setCaseSnapshot((prev) => ({
+        ...prev,
+        shippingPreference,
+      }));
+    }
 
-                {/* Retry Button */}
-                <Button
-                  onClick={() => window.location.reload()}
-                  variant="default"
-                  className="mt-2"
-                >
-                  Retry Connection
-                </Button>
-              </>
-            )}
-          </div>
-        </div>
+    pushMessage({ id: randomId(), role: "user", text });
 
-        {/* Settings Modal */}
-        <SettingsModal open={showAboutModal} onOpenChange={setShowAboutModal} />
-      </div>
-    );
-  }
+    await runWithPayload({
+      thread_id: threadIdRef.current,
+      run_id: randomId(),
+      messages: [],
+      resume: {
+        interrupts: [
+          {
+            id: currentInterrupt.id,
+            value: [
+              {
+                role: "user",
+                contents: [{ type: "text", text }],
+              },
+            ],
+          },
+        ],
+      },
+    });
+  };
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault();
+    const trimmed = inputText.trim();
+    if (!trimmed || isRunning) {
+      return;
+    }
+
+    setInputText("");
+
+    if (currentInterruptKind === "approval") {
+      setIsApprovalModalOpen(true);
+      return;
+    }
+
+    if (currentInterruptKind === "handoff_input") {
+      await resumeHandoffInput(trimmed);
+      return;
+    }
+
+    await startNewTurn(trimmed);
+  };
 
   return (
-    <div className="h-screen flex flex-col bg-background max-h-screen">
-      <AppHeader
-        agents={agents}
-        workflows={workflows}
-        entities={entities}
-        selectedItem={selectedAgent}
-        onSelect={handleEntitySelect}
-        onBrowseGallery={() => setShowGallery(true)}
-        isLoading={isLoadingEntities}
-        onSettingsClick={() => setShowAboutModal(true)}
-      />
+    <div className="page-shell">
+      <header className="hero">
+        <div>
+          <p className="eyebrow">AG-UI Workflow Demo</p>
+          <h1>Handoff + Tool Approval</h1>
+          <p className="subtitle">
+            Dynamic workflow exercising AG-UI run events, interrupt resumes, function approvals, and stateful
+            per-thread execution.
+          </p>
+        </div>
+        <div className="status-pill" data-running={isRunning}>
+          <span>Status</span>
+          <strong>{statusText}</strong>
+        </div>
+      </header>
 
-      {/* Main Content - Split Panel or Gallery */}
-      <div className="flex flex-1 overflow-hidden">
-        {showGallery ? (
-          // Show gallery full screen (w-full ensures it takes entire width)
-          <div className="flex-1 w-full">
-            <GalleryView
-              variant="route"
-              onClose={() => setShowGallery(false)}
-              hasExistingEntities={
-                agents.length > 0 || workflows.length > 0
-              }
-            />
-          </div>
-        ) : agents.length === 0 && workflows.length === 0 ? (
-          // Empty state - show gallery inline (full width, no debug panel)
-          <GalleryView variant="inline" />
-        ) : (
-          <>
-            {/* Left Panel - Main View */}
-            <div className="flex-1 min-w-0">
-              {selectedAgent ? (
-                selectedAgent.type === "agent" ? (
-                  <AgentView
-                    selectedAgent={selectedAgent as AgentInfo}
-                    onDebugEvent={handleDebugEvent}
-                  />
-                ) : (
-                  <WorkflowView
-                    selectedWorkflow={selectedAgent as WorkflowInfo}
-                    onDebugEvent={handleDebugEvent}
-                  />
-                )
-              ) : (
-                <div className="flex-1 flex items-center justify-center text-muted-foreground">
-                  Select an agent or workflow to get started.
-                </div>
-              )}
+      <div className="layout">
+        <section className="dashboard-panel">
+          <article className="card snapshot-card">
+            <h2>Case Snapshot</h2>
+            <div className="snapshot-grid">
+              <div>
+                <span>Order ID</span>
+                <strong>{caseSnapshot.orderId}</strong>
+              </div>
+              <div>
+                <span>Refund Amount</span>
+                <strong>{caseSnapshot.refundAmount}</strong>
+              </div>
+              <div>
+                <span>Refund Approval</span>
+                <strong data-state={caseSnapshot.refundApproved}>{caseSnapshot.refundApproved}</strong>
+              </div>
+              <div>
+                <span>Shipping Preference</span>
+                <strong>{caseSnapshot.shippingPreference}</strong>
+              </div>
             </div>
+          </article>
 
-            {uiMode === "developer" && showDebugPanel ? (
-              <>
-                {/* Resize Handle */}
-                <div
-                  className={`w-1 cursor-col-resize flex-shrink-0 relative group transition-colors duration-200 ease-in-out ${
-                    isResizing ? "bg-primary/40" : "bg-border hover:bg-primary/20"
-                  }`}
-                  onMouseDown={handleMouseDown}
+          <article className="card agents-card">
+            <h2>Active Agent</h2>
+            <div className="agent-pills">
+              {KNOWN_AGENTS.map((agent) => (
+                <button
+                  key={agent}
+                  type="button"
+                  className="agent-pill"
+                  data-active={agent === activeAgent}
+                  data-seen={visitedAgents.has(agent)}
+                  disabled
                 >
-                  <div className="absolute inset-y-0 -left-2 -right-2 flex items-center justify-center">
-                    <div
-                      className={`h-12 w-1 rounded-full transition-all duration-200 ease-in-out ${
-                        isResizing
-                          ? "bg-primary shadow-lg shadow-primary/25"
-                          : "bg-primary/30 group-hover:bg-primary group-hover:shadow-md group-hover:shadow-primary/20"
-                      }`}
-                    ></div>
+                  {AGENT_LABELS[agent]}
+                </button>
+              ))}
+            </div>
+          </article>
+
+          <article className="card diagnostics-card">
+            <h2>Diagnostics</h2>
+            {!latestUsage && <p className="muted">Usage appears when the final streaming chunk arrives.</p>}
+
+            {latestUsage && (
+              <div className="diagnostics-body">
+                <div className="diagnostics-grid">
+                  <div>
+                    <span>Run ID</span>
+                    <strong>{latestUsage.runId}</strong>
+                  </div>
+                  <div>
+                    <span>Input Tokens</span>
+                    <strong>{latestUsage.inputTokenCount ?? "n/a"}</strong>
+                  </div>
+                  <div>
+                    <span>Output Tokens</span>
+                    <strong>{latestUsage.outputTokenCount ?? "n/a"}</strong>
+                  </div>
+                  <div>
+                    <span>Total Tokens</span>
+                    <strong>{latestUsage.totalTokenCount ?? "n/a"}</strong>
                   </div>
                 </div>
 
-                {/* Right Panel - Debug */}
-                <div
-                  className="flex-shrink-0 flex flex-col h-[calc(100vh-3.7rem)]"
-                  style={{ width: debugPanelMinimized ? '2.5rem' : `${debugPanelWidth}px` }}
-                >
-                  {debugPanelMinimized ? (
-                    /* Minimized Debug Panel - Vertical Bar (fully clickable) */
-                    <div
-                      className="h-full w-10 bg-background border-l flex flex-col items-center py-2 cursor-pointer hover:bg-accent/50 transition-colors"
-                      onClick={() => setDebugPanelMinimized(false)}
-                      title="Expand debug panel"
-                    >
-                      {/* Expand button at top (visual affordance) */}
-                      <div className="h-8 w-8 flex items-center justify-center">
-                        <ChevronLeft className="h-4 w-4 text-muted-foreground" />
-                      </div>
+                <p className="muted diagnostics-timestamp">
+                  Last updated {new Date(latestUsage.recordedAt).toLocaleTimeString()}
+                </p>
 
-                      {/* Text and count centered in middle */}
-                      <div className="flex-1 flex flex-col items-center justify-center gap-2 pointer-events-none">
-                        <div
-                          className="text-xs text-muted-foreground select-none"
-                          style={{
-                            writingMode: 'vertical-rl',
-                            transform: 'rotate(180deg)'
-                          }}
-                        >
-                          Debug Panel
-                        </div>
-                        {debugEvents.length > 0 && (
-                          <div className="bg-primary text-primary-foreground rounded-full w-5 h-5 flex items-center justify-center"
-                          style={{ fontSize: '10px' }}>
-                            {debugEvents.length}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ) : (
-                    <>
-                      <DebugPanel
-                        events={debugEvents}
-                        isStreaming={false} // Each view manages its own streaming state
-                        onMinimize={() => setDebugPanelMinimized(true)}
-                      />
+                <details className="diagnostics-raw">
+                  <summary>Raw usage payload</summary>
+                  <pre>{JSON.stringify(latestUsage.raw, null, 2)}</pre>
+                </details>
 
-                      {/* Deploy Footer - Pinned to bottom */}
-                      <div className="border-t bg-muted/30 px-3 py-2.5 flex-shrink-0">
-                        <Button
-                          onClick={() => setShowDeployModal(true)}
-                          className="w-full"
-                          variant="outline"
-                          size="sm"
-                        >
-                          <Rocket className="h-3 w-3 mr-2 flex-shrink-0" />
-                          <span className="truncate text-xs">
-                            {azureDeploymentEnabled && selectedAgent?.deployment_supported
-                              ? "Deploy to Azure"
-                              : "Deployment Guide"}
-                          </span>
-                        </Button>
+                {usageHistory.length > 1 && (
+                  <div className="diagnostics-history">
+                    <h3>Recent runs</h3>
+                    {usageHistory.map((entry, index) => (
+                      <div key={`${entry.runId}-${entry.recordedAt}-${index}`} className="diagnostics-history-item">
+                        <span>{entry.runId}</span>
+                        <strong>{entry.totalTokenCount ?? "n/a"} total</strong>
                       </div>
-                    </>
-                  )}
-                </div>
-              </>
-            ) : uiMode === "developer" ? (
-              /* Button to reopen when closed */
-              <div className="flex-shrink-0">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setShowDebugPanel(true)}
-                  className="h-full w-10 rounded-none border-l"
-                  title="Show debug panel"
-                >
-                  <PanelRightOpen className="h-4 w-4" />
-                </Button>
+                    ))}
+                  </div>
+                )}
               </div>
-            ) : null}
-          </>
-        )}
+            )}
+          </article>
+
+          <article className="card interrupt-card">
+            <h2>Pending Action</h2>
+            {!currentInterrupt && (
+              <div className="pending-empty-state">
+                <p className="muted">
+                  {isCaseClosed
+                    ? "This case is closed. New top-level messages on this thread are blocked until you start a new case."
+                    : "No interrupt pending. Start with one of the prompts below."}
+                </p>
+                {canStartFreshCase && (
+                  <button type="button" className="case-reset" onClick={resetConversationState} disabled={isRunning}>
+                    Start New Case
+                  </button>
+                )}
+              </div>
+            )}
+
+            {currentInterrupt && (
+              <div className="interrupt-body">
+                <p>{interruptPrompt}</p>
+
+                {currentInterruptKind === "approval" && (
+                  <div className="approval-inline">
+                    <p className="muted">
+                      Customer input is paused. A separate reviewer must approve or reject this tool call.
+                    </p>
+                    <div className="approval-details">
+                      <p>
+                        <strong>Function:</strong> {String(functionCall?.name ?? "tool_call")}
+                      </p>
+                      <pre>{JSON.stringify(functionArguments, null, 2)}</pre>
+                    </div>
+                    <button
+                      type="button"
+                      className="approval-launch"
+                      onClick={() => setIsApprovalModalOpen(true)}
+                      disabled={isRunning}
+                    >
+                      Open Reviewer Modal
+                    </button>
+                  </div>
+                )}
+
+                {currentInterruptKind === "handoff_input" && (
+                  <p className="muted">Reply in the chat input to resume this request.</p>
+                )}
+              </div>
+            )}
+
+            {!currentInterrupt && !isCaseClosed && (
+              <div className="starter-prompts">
+                {STARTER_PROMPTS.map((prompt) => (
+                  <button key={prompt} type="button" onClick={() => void startNewTurn(prompt)} disabled={isRunning}>
+                    {prompt}
+                  </button>
+                ))}
+              </div>
+            )}
+          </article>
+        </section>
+
+        <section className="chat-panel">
+          <div className="chat-scroll">
+            {messages.length === 0 && (
+              <div className="empty-state">
+                <p>Send a message to start the handoff workflow.</p>
+              </div>
+            )}
+
+            {messages.map((message) => (
+              <article key={message.id} className="chat-bubble" data-role={message.role}>
+                <header>{message.role}</header>
+                <p>{message.text}</p>
+              </article>
+            ))}
+          </div>
+
+          <form className="chat-input" onSubmit={(event) => void handleSubmit(event)}>
+            <input
+              value={inputText}
+              onChange={(event) => setInputText(event.target.value)}
+              placeholder={
+                currentInterruptKind === "approval"
+                  ? "Waiting for reviewer approval..."
+                  : currentInterruptKind === "handoff_input"
+                    ? "Reply to continue..."
+                    : isCaseClosed
+                      ? "This case is complete. Click Start New Case to open a fresh thread..."
+                      : "Describe your issue..."
+              }
+              disabled={isRunning || currentInterruptKind === "approval"}
+            />
+            <button type="submit" disabled={isRunning || currentInterruptKind === "approval" || inputText.trim().length === 0}>
+              Send
+            </button>
+          </form>
+        </section>
       </div>
 
-      {/* Settings Modal */}
-      <SettingsModal open={showAboutModal} onOpenChange={setShowAboutModal} />
+      {currentInterruptKind === "approval" && currentInterrupt && isApprovalModalOpen && (
+        <div className="approval-modal-backdrop" onClick={() => setIsApprovalModalOpen(false)}>
+          <section className="approval-modal" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+            <header className="approval-modal-header">
+              <div>
+                <p className="approval-modal-label">HITL Reviewer Console</p>
+                <h3>Tool Approval Required</h3>
+              </div>
+              <button type="button" className="approval-modal-close" onClick={() => setIsApprovalModalOpen(false)}>
+                Close
+              </button>
+            </header>
 
-      {/* Deployment Modal */}
-      <DeploymentModal
-        open={showDeployModal}
-        onClose={() => setShowDeployModal(false)}
-        agentName={selectedAgent?.name}
-        entity={selectedAgent}
-      />
+            <p className="muted">{interruptPrompt}</p>
 
-      {/* Toast Notification */}
-      {showEntityNotFoundToast && (
-        <Toast
-          message="Entity not found. Showing first available entity instead."
-          type="info"
-          onClose={() => setShowEntityNotFoundToast(false)}
-        />
+            <div className="approval-details">
+              <p>
+                <strong>Function:</strong> {String(functionCall?.name ?? "tool_call")}
+              </p>
+              <pre>{JSON.stringify(functionArguments, null, 2)}</pre>
+            </div>
+
+            <div className="approval-actions">
+              <button type="button" className="defer" onClick={() => setIsApprovalModalOpen(false)} disabled={isRunning}>
+                Defer
+              </button>
+              <button type="button" className="reject" onClick={() => void resumeApproval(false)} disabled={isRunning}>
+                Reject Tool Call
+              </button>
+              <button type="button" className="approve" onClick={() => void resumeApproval(true)} disabled={isRunning}>
+                Approve Tool Call
+              </button>
+            </div>
+          </section>
+        </div>
       )}
-
-      {/* Toast Container for reload and other notifications */}
-      <ToastContainer toasts={toasts} onRemove={removeToast} />
     </div>
   );
 }
