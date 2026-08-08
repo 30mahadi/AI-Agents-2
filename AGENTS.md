@@ -1,40 +1,49 @@
-# Declarative Package (agent-framework-declarative)
+# DevUI Package (agent-framework-devui)
 
-YAML/JSON-based declarative agent and workflow definitions.
+Interactive developer UI for testing and debugging agents and workflows.
 
 ## Main Classes
 
-- **`AgentFactory`** - Creates agents from declarative definitions
-- **`WorkflowFactory`** - Creates workflows from declarative definitions
-- **`WorkflowState`** - State management for declarative workflows
-- **`ProviderTypeMapping`** - Maps provider types to implementations
-- **`HttpRequestHandler`** / **`DefaultHttpRequestHandler`** - Pluggable HTTP transport for the `HttpRequestAction` declarative action (configured via `WorkflowFactory(http_request_handler=...)`)
-- **`MCPToolHandler`** / **`DefaultMCPToolHandler`** - Pluggable MCP transport for the `InvokeMcpTool` declarative action (configured via `WorkflowFactory(mcp_tool_handler=...)`)
-- **`DeclarativeLoaderError`** / **`ProviderLookupError`** / **`DeclarativeWorkflowError`** / **`DeclarativeActionError`** - Error types
+- **`serve()`** - Launch the DevUI server
+- **`DevServer`** - The FastAPI-based development server
+- **`register_cleanup()`** - Register cleanup hooks for entities
+- **`CheckpointConversationManager`** - Manages conversation checkpoints
 
-## External Input Handling
+## Models
 
-- **`ExternalInputRequest`** / **`ExternalInputResponse`** - Human-in-the-loop support
-- **`AgentExternalInputRequest`** / **`AgentExternalInputResponse`** - Agent-level input requests
+- **`AgentFrameworkRequest`** - Request model for agent invocations
+- **`OpenAIResponse`** / **`OpenAIError`** - OpenAI-compatible response models
+- **`DiscoveryResponse`** / **`EntityInfo`** - Entity discovery models
 
 ## Usage
 
 ```python
-from agent_framework.declarative import AgentFactory, WorkflowFactory
+from agent_framework.devui import serve
 
-# Create agent from YAML file
-agent_factory = AgentFactory()
-agent = agent_factory.create_agent_from_yaml_path("agent.yaml")
-
-# Create workflow from YAML file
-workflow_factory = WorkflowFactory()
-workflow = workflow_factory.create_workflow_from_yaml_path("workflow.yaml")
+agent = Agent(...)
+serve(entities=[agent], port=8080, auto_open=True)
 ```
+
+## CLI
+
+```bash
+# Run with auto-discovery
+devui ./agents
+
+# Run with specific entities
+devui --entities my_agent.py
+```
+
+## Security Posture
+
+DevUI is a development-only sample app, not a production hosting surface. Authentication is enabled by default.
+Unauthenticated mode is allowed only on `localhost` / `127.0.0.1`; `0.0.0.0`, LAN IPs, and hostnames require
+`DEVUI_AUTH_TOKEN` or `--auth-token`.
 
 ## Import Path
 
 ```python
-from agent_framework.declarative import AgentFactory, WorkflowFactory
+from agent_framework.devui import serve, register_cleanup
 # or directly:
-from agent_framework_declarative import AgentFactory
+from agent_framework_devui import serve
 ```
