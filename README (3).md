@@ -1,47 +1,70 @@
-# Anthropic Examples
+# Skills Auto-Approval — Configure Auto-Approval Rules for Skill Tools
 
-This folder contains examples demonstrating how to use Anthropic's Claude models with the Agent Framework.
+This sample demonstrates how to configure **auto-approval rules** for skill
+tools using `ToolApprovalMiddleware`. Every tool exposed by `SkillsProvider`
+(`load_skill`, `read_skill_resource`, and `run_skill_script`) requires host
+approval by default. Auto-approval rules let you selectively bypass the approval
+prompt for safe operations.
 
-## Anthropic Client Examples
+## How It Works
 
-| File | Description |
-|------|-------------|
-| [`anthropic_basic.py`](anthropic_basic.py) | Demonstrates how to setup a simple agent using the AnthropicClient, with both streaming and non-streaming responses. |
-| [`anthropic_advanced.py`](anthropic_advanced.py) | Shows advanced usage of the AnthropicClient, including hosted tools and `thinking`. |
-| [`anthropic_skills.py`](anthropic_skills.py) | Illustrates how to use Anthropic-managed Skills with an agent, including the Code Interpreter tool and file generation and saving. |
-| [`anthropic_foundry.py`](anthropic_foundry.py) | Example of using Foundry's Anthropic integration with the Agent Framework. |
+1. A code-defined unit-converter skill (with a resource and a script) is registered via `SkillsProvider`.
+2. The agent installs `ToolApprovalMiddleware` with `SkillsProvider.read_only_tools_auto_approval_rule`.
+3. The read-only tools (`load_skill`, `read_skill_resource`) are approved automatically.
+4. `run_skill_script` still requires explicit approval and is handled with the standard `result.user_input_requests` loop.
 
-## Claude Agent Examples
+## Auto-Approval Rules
 
-| File | Description |
-|------|-------------|
-| [`anthropic_claude_basic.py`](anthropic_claude_basic.py) | Basic usage of ClaudeAgent with streaming, non-streaming, and custom tools. |
-| [`anthropic_claude_with_tools.py`](anthropic_claude_with_tools.py) | Using built-in tools (Read, Glob, Grep, etc.). |
-| [`anthropic_claude_with_shell.py`](anthropic_claude_with_shell.py) | Shell command execution with interactive permission handling. |
-| [`anthropic_claude_with_multiple_permissions.py`](anthropic_claude_with_multiple_permissions.py) | Combining multiple tools (Bash, Read, Write) with permission prompts. |
-| [`anthropic_claude_with_url.py`](anthropic_claude_with_url.py) | Fetching and processing web content with WebFetch. |
-| [`anthropic_claude_with_mcp.py`](anthropic_claude_with_mcp.py) | Local (stdio) and remote (HTTP) MCP server configuration. |
-| [`anthropic_claude_with_session.py`](anthropic_claude_with_session.py) | Session management, persistence, and resumption. |
+`SkillsProvider` exposes two static rules to pass to `ToolApprovalMiddleware(auto_approval_rules=[...])`:
 
-## Environment Variables
+- **`SkillsProvider.read_only_tools_auto_approval_rule`** — approves only the read-only tools (`load_skill`, `read_skill_resource`), while still prompting for `run_skill_script`.
+- **`SkillsProvider.all_tools_auto_approval_rule`** — approves every skill tool, including `run_skill_script` (no manual approval loop needed).
 
-### Anthropic Client
+Both rules reject any call carrying a `server_label`, so they stay scoped to this provider's local tools and never auto-approve a same-named hosted tool.
 
-- `ANTHROPIC_API_KEY`: Your Anthropic API key (get one from [Anthropic Console](https://console.anthropic.com/))
-- `ANTHROPIC_CHAT_MODEL`: The Claude model to use (e.g., `claude-haiku-4-5`, `claude-sonnet-4-5-20250929`)
+> ⚠️ **Security — avoid tool-name collisions:** these rules approve local skill
+> tools by tool name only (`load_skill`, `read_skill_resource`, and — for
+> `all_tools_auto_approval_rule` — `run_skill_script`). Auto-approval rules may
+> match by name, so any other local tool registered under one of these names —
+> for example a tool with a caller-configurable name such as the shell tool — may
+> also be auto-approved, bypassing the human approval boundary. Ensure no other
+> tool collides with these reserved names.
 
-### Foundry
+> **Note:** To use auto-approval rules, the agent must have `ToolApprovalMiddleware` in its middleware stack.
 
-- `ANTHROPIC_FOUNDRY_API_KEY`: Your Foundry Anthropic API key
-- `ANTHROPIC_FOUNDRY_RESOURCE`: Your Foundry resource name (for example `my-foundry-resource`)
-- `ANTHROPIC_FOUNDRY_BASE_URL`: Optional full Foundry Anthropic base URL alternative to `ANTHROPIC_FOUNDRY_RESOURCE`
-- `ANTHROPIC_CHAT_MODEL`: The Claude model to use in Foundry (e.g., `claude-haiku-4-5`)
+## Key Components
 
-### Claude Agent
+- **`ToolApprovalMiddleware(auto_approval_rules=[...])`** — Drives the approval handshake and applies the rules
+- **`SkillsProvider.read_only_tools_auto_approval_rule`** — Auto-approves read-only skill tools
+- **`SkillsProvider.all_tools_auto_approval_rule`** — Auto-approves all skill tools
+- **`SkillsProvider.LOAD_SKILL_TOOL_NAME` / `READ_SKILL_RESOURCE_TOOL_NAME` / `RUN_SKILL_SCRIPT_TOOL_NAME`** — Tool-name constants for building custom rules
 
-- `CLAUDE_AGENT_CLI_PATH`: Path to the Claude Code CLI executable
-- `CLAUDE_AGENT_MODEL`: Model to use (sonnet, opus, haiku)
-- `CLAUDE_AGENT_CWD`: Working directory for Claude CLI
-- `CLAUDE_AGENT_PERMISSION_MODE`: Permission mode (default, acceptEdits, plan, bypassPermissions)
-- `CLAUDE_AGENT_MAX_TURNS`: Maximum number of conversation turns
-- `CLAUDE_AGENT_MAX_BUDGET_USD`: Maximum budget in USD
+## Running the Sample
+
+### Prerequisites
+- A [Microsoft Foundry](https://ai.azure.com/) project with a deployed model (e.g. `gpt-4o-mini`)
+
+### Environment Variables
+
+Set the required environment variables in a `.env` file (see `python/.env.example`):
+
+- `FOUNDRY_PROJECT_ENDPOINT`: Your Microsoft Foundry project endpoint
+- `FOUNDRY_MODEL`: The name of your model deployment (defaults to `gpt-4o-mini`)
+
+### Authentication
+
+This sample uses `AzureCliCredential` for authentication. Run `az login` in your terminal before running the sample.
+
+### Run
+
+```bash
+cd python
+uv run samples/02-agents/skills/skills_auto_approval/skills_auto_approval.py
+```
+
+## Learn More
+
+- [Skill Tool Approval Sample](../script_approval/) — manual human-in-the-loop approval
+- [Code-Defined Skills Sample](../code_defined_skill/)
+- [File-Based Skills Sample](../file_based_skill/)
+- [Agent Skills Specification](https://agentskills.io/)

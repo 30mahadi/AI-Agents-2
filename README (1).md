@@ -1,69 +1,60 @@
-# Custom Agent and Chat Client Examples
+# Skill Tool Approval — Human-in-the-Loop for Skill Tools
 
-This folder contains examples demonstrating how to implement custom agents and chat clients using the Microsoft Agent Framework.
+This sample demonstrates the **manual human-in-the-loop** approval pattern for
+skill tools. Every tool exposed by `SkillsProvider` (`load_skill`,
+`read_skill_resource`, and `run_skill_script`) requires host approval by
+default, so the agent pauses and returns approval requests that your
+application approves or rejects.
 
-## Examples
+## How It Works
 
-| File | Description |
-|------|-------------|
-| [`custom_agent.py`](custom_agent.py) | Shows how to create custom agents by extending the `BaseAgent` class. Demonstrates the `EchoAgent` implementation with both streaming and non-streaming responses, proper session management, and message history handling. |
-| [`custom_chat_client.py`](../../chat_client/custom_chat_client.py) | Demonstrates how to create custom chat clients by extending the `BaseChatClient` class. Shows a `EchoingChatClient` implementation and how to integrate it with `Agent` using the `as_agent()` method. |
+By default, skill tools require approval. The agent pauses before running any of
+them and returns approval requests instead:
 
-## Key Takeaways
+1. The agent tries to call a skill tool (e.g. `load_skill` or `run_skill_script`) — execution is paused
+2. `result.user_input_requests` contains approval request(s) with function name and arguments
+3. The application inspects each request and decides to approve or reject
+4. `request.to_function_approval_response(approved=True|False)` creates the response
+5. The response is sent back via `agent.run(approval_response, session=session)`
+6. If approved, the tool runs; if rejected, the agent receives an error
 
-### Custom Agents
-- Custom agents give you complete control over the agent's behavior
-- You must implement both `run()` for both the `stream=True` and `stream=False` cases
-- Use `self._normalize_messages()` to handle different input message formats
-- Store messages in `session.state` to properly manage conversation history
+## Key Components
 
-### Custom Chat Clients
-- Custom chat clients allow you to integrate any backend service or create new LLM providers
-- You must implement `_inner_get_response()` with a stream parameter to handle both streaming and non-streaming responses
-- Custom chat clients can be used with `Agent` to leverage all agent framework features
-- Use the `as_agent()` method to easily create agents from your custom chat clients
+- **Approval-by-default** — All skill tools require host approval; no extra configuration is needed
+- **`result.user_input_requests`** — Contains pending approval requests after `agent.run()`
+- **`request.to_function_approval_response()`** — Creates an approval or rejection response
 
-Both approaches allow you to extend the framework for your specific use cases while maintaining compatibility with the broader Agent Framework ecosystem.
+To approve skill tools automatically instead of prompting for each one, use
+`ToolApprovalMiddleware` with one of the static auto-approval rules — see the
+[Skills Auto-Approval Sample](../skills_auto_approval/).
 
-## Understanding Raw Client Classes
+## Running the Sample
 
-The framework provides `Raw...Client` classes (e.g., `RawOpenAIChatClient`, `RawOpenAIChatCompletionClient`, `RawFoundryChatClient`) that are intermediate implementations without middleware, telemetry, or function invocation support.
+### Prerequisites
+- A [Microsoft Foundry](https://ai.azure.com/) project with a deployed model (e.g. `gpt-4o-mini`)
 
-### Warning: Raw Clients Should Not Normally Be Used Directly
+### Environment Variables
 
-**The `Raw...Client` classes should not normally be used directly.** They do not include the middleware, telemetry, or function invocation support that you most likely need. If you do use them, you should carefully consider which additional layers to apply.
+Set the required environment variables in a `.env` file (see `python/.env.example`):
 
-### Layer Ordering
+- `FOUNDRY_PROJECT_ENDPOINT`: Your Microsoft Foundry project endpoint
+- `FOUNDRY_MODEL`: The name of your model deployment (defaults to `gpt-4o-mini`)
 
-There is a defined ordering for applying layers that you should follow:
+### Authentication
 
-1. **FunctionInvocationLayer** - Handles the tool/function calling loop and should stay outermost
-2. **ChatMiddlewareLayer** - Wraps each model call in the loop and stays outside telemetry
-3. **ChatTelemetryLayer** - Must be inside the function calling loop so each model call gets its own telemetry span
-4. **Raw...Client** - The base implementation (e.g., `RawOpenAIChatClient`)
+This sample uses `AzureCliCredential` for authentication. Run `az login` in your terminal before running the sample.
 
-Example of correct layer composition:
+### Run
 
-```python
-class MyCustomClient(
-    FunctionInvocationLayer[TOptions],
-    ChatMiddlewareLayer[TOptions],
-    ChatTelemetryLayer[TOptions],
-    RawOpenAIChatClient[TOptions],  # or BaseChatClient for custom implementations
-    Generic[TOptions],
-):
-    """Custom client with all layers correctly applied."""
-    pass
+```bash
+cd python
+uv run samples/02-agents/skills/script_approval/script_approval.py
 ```
 
-### Use Fully-Featured Clients Instead
+## Learn More
 
-For most use cases, use the fully-featured public client classes which already have all layers correctly composed:
-
-- `OpenAIChatCompletionClient` - OpenAI Chat Completions API with all layers
-- `OpenAIChatClient` - OpenAI Responses API with all layers
-- `OpenAIChatCompletionClient` - Azure OpenAI Chat Completions with all layers
-- `OpenAIChatClient` - Azure OpenAI Responses with all layers
-- `FoundryChatClient` - Microsoft Foundry project-backed chat with all layers
-
-These clients handle the layer composition correctly and provide the full feature set out of the box.
+- [Skills Auto-Approval Sample](../skills_auto_approval/)
+- [File-Based Skills Sample](../file_based_skill/)
+- [Code-Defined Skills Sample](../code_defined_skill/)
+- [Mixed Skills Sample](../mixed_skills/)
+- [Agent Skills Specification](https://agentskills.io/)

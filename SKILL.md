@@ -1,18 +1,21 @@
 ---
-name: risk-scoring
-description: Score how concentrated and risky a portfolio is on a 0-100 scale from its position weights. Use when the user asks how risky their portfolio is, whether it is too concentrated, or for a diversification check.
+name: length-converter
+description: Convert between common length units (miles, km, feet, meters) using a multiplication factor.
+license: MIT
+compatibility: Works with any model that supports tool use.
+allowed-tools: convert
+metadata:
+  author: agent-framework-samples
+  version: "1.0"
 ---
 
 ## Usage
 
-When the user asks about portfolio risk or concentration:
+When the user requests a length conversion, run the `scripts/convert.py`
+script with `--value <number> --factor <factor>`.
 
-1. Read `references/risk-bands.md` to understand the score bands and what drives them.
-2. Compute each holding's market value (shares × price) — use the `get_stock_price` tool for current
-   prices if you do not already have them.
-3. Run `scripts/risk_score.py` with one `--position VALUE` argument per holding,
-   e.g. `--position 18518 --position 17201 --position 16177`.
-4. Report the 0-100 score, the band it falls in, and the largest single-position weight, then suggest
-   (in general terms) whether the portfolio looks well diversified or concentrated.
-
-Remind the user this is a crude concentration measure, not a complete risk model, and not advice.
+Common factors:
+- miles → km: 1.60934
+- km → miles: 0.621371
+- feet → meters: 0.3048
+- meters → feet: 3.28084
