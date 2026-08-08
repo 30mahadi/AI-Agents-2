@@ -1,35 +1,49 @@
-# DevUI Foundry File Search Agent
+# Code-Defined Agent Skills
 
-Interactive web UI for uploading and chatting with documents, images, audio, and video using Azure Content Understanding + Foundry file_search RAG.
+This sample demonstrates how to create **Agent Skills** in Python code, without needing `SKILL.md` files on disk. A unit-converter skill shows three approaches:
 
-This is the **Foundry** variant. For the Azure OpenAI Responses API variant, see
-`agent_content_understanding_file_search_azure_openai`.
+## What's Demonstrated
 
-## How It Works
+1. **Static Resources** — Pass inline content via the `resources` parameter when constructing a `Skill`
+2. **Dynamic Resources** — Attach callable functions via the `@skill.resource` decorator that return content computed at runtime
+3. **Dynamic Scripts** — Attach callable scripts via the `@skill.script` decorator (unit conversion via a single factor parameter)
 
-1. **Upload** any supported file (PDF, image, audio, video) via the DevUI chat
-2. **CU analyzes** the file — auto-selects the right analyzer per media type
-3. **Markdown extracted** by CU is uploaded to a Foundry vector store
-4. **file_search** tool is registered — LLM retrieves top-k relevant chunks
-5. **Ask questions** across all uploaded documents with token-efficient RAG
+All three can be combined with file-based skills in a single `SkillsProvider`.
 
-## Setup
+## Project Structure
 
-1. Set environment variables (or create a `.env` file in `python/`):
-   ```bash
-   FOUNDRY_PROJECT_ENDPOINT=https://your-project.services.ai.azure.com/
-   FOUNDRY_MODEL=gpt-4.1
-   AZURE_CONTENTUNDERSTANDING_ENDPOINT=https://your-cu-resource.services.ai.azure.com/
-   ```
+```
+code_defined_skill/
+├── code_defined_skill.py
+└── README.md
+```
 
-2. Log in with Azure CLI:
-   ```bash
-   az login
-   ```
+## Running the Sample
 
-3. Run with DevUI:
-   ```bash
-   devui samples/02-agents/devui/agent_content_understanding_file_search_foundry
-   ```
+### Prerequisites
+- A [Microsoft Foundry](https://ai.azure.com/) project with a deployed model (e.g. `gpt-4o-mini`)
 
-4. Open the DevUI URL in your browser and start uploading files.
+### Environment Variables
+
+Set the required environment variables in a `.env` file (see `python/.env.example`):
+
+- `FOUNDRY_PROJECT_ENDPOINT`: Your Microsoft Foundry project endpoint
+- `AZURE_OPENAI_MODEL`: The name of your model deployment (defaults to `gpt-4o-mini`)
+
+### Authentication
+
+This sample uses `AzureCliCredential` for authentication. Run `az login` in your terminal before running the sample.
+
+### Run
+
+```bash
+cd python
+uv run samples/02-agents/skills/code_defined_skill/code_defined_skill.py
+```
+
+## Learn More
+
+- [Agent Skills Specification](https://agentskills.io/)
+- [File-Based Skills Sample](../file_based_skill/)
+- [Mixed Skills Sample](../mixed_skills/)
+- [Microsoft Agent Framework Documentation](../../../../../docs/)

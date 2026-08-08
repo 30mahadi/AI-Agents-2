@@ -1,35 +1,71 @@
-# DevUI Foundry File Search Agent
+# Class-Based Agent Skills
 
-Interactive web UI for uploading and chatting with documents, images, audio, and video using Azure Content Understanding + Foundry file_search RAG.
+This sample demonstrates how to define **Agent Skills as Python classes** using `ClassSkill`.
 
-This is the **Foundry** variant. For the Azure OpenAI Responses API variant, see
-`agent_content_understanding_file_search_azure_openai`.
+## What's Demonstrated
 
-## How It Works
+- Creating skills as classes that extend `ClassSkill`
+- Bundling name, description, instructions, resources, and scripts into a single class
+- Using `@ClassSkill.resource` decorator for automatic resource discovery
+- Using `@ClassSkill.script` decorator for automatic script discovery
+- Lazy-loading and caching of resources and scripts
+- Registering class-based skills with `SkillsProvider`
 
-1. **Upload** any supported file (PDF, image, audio, video) via the DevUI chat
-2. **CU analyzes** the file — auto-selects the right analyzer per media type
-3. **Markdown extracted** by CU is uploaded to a Foundry vector store
-4. **file_search** tool is registered — LLM retrieves top-k relevant chunks
-5. **Ask questions** across all uploaded documents with token-efficient RAG
+## Skills Included
 
-## Setup
+### unit-converter (class-based)
 
-1. Set environment variables (or create a `.env` file in `python/`):
-   ```bash
-   FOUNDRY_PROJECT_ENDPOINT=https://your-project.services.ai.azure.com/
-   FOUNDRY_MODEL=gpt-4.1
-   AZURE_CONTENTUNDERSTANDING_ENDPOINT=https://your-cu-resource.services.ai.azure.com/
-   ```
+A `UnitConverterSkill` class that converts between common units. Defined in `class_based_skill.py`:
 
-2. Log in with Azure CLI:
-   ```bash
-   az login
-   ```
+- `conversion-table` — Static resource with factor table
+- `convert` — Script that performs `value × factor` conversion
 
-3. Run with DevUI:
-   ```bash
-   devui samples/02-agents/devui/agent_content_understanding_file_search_foundry
-   ```
+## Project Structure
 
-4. Open the DevUI URL in your browser and start uploading files.
+```
+class_based_skill/
+├── class_based_skill.py
+└── README.md
+```
+
+## Running the Sample
+
+### Prerequisites
+
+- A [Microsoft Foundry](https://ai.azure.com/) project with a deployed model (e.g. `gpt-4o-mini`)
+
+### Environment Variables
+
+Set the required environment variables in a `.env` file (see `python/.env.example`):
+
+- `FOUNDRY_PROJECT_ENDPOINT`: Your Microsoft Foundry project endpoint
+- `FOUNDRY_MODEL`: The name of your model deployment (defaults to `gpt-4o-mini`)
+
+### Authentication
+
+This sample uses `AzureCliCredential` for authentication. Run `az login` in your terminal before running the sample.
+
+### Run
+
+```bash
+cd python
+uv run samples/02-agents/skills/class_based_skill/class_based_skill.py
+```
+
+### Expected Output
+
+```
+Converting units with class-based skills
+------------------------------------------------------------
+Agent: Here are your conversions:
+
+1. **26.2 miles → 42.16 km** (a marathon distance)
+2. **75 kg → 165.35 lbs**
+```
+
+## Learn More
+
+- [Agent Skills Specification](https://agentskills.io/)
+- [Code-Defined Skills Sample](../code_defined_skill/)
+- [Mixed Skills Sample](../mixed_skills/)
+- [Microsoft Agent Framework Documentation](../../../../../docs/)

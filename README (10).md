@@ -1,56 +1,68 @@
-# Conversation & Session Management Samples
+# MCP-Based Agent Skills Sample
 
-These samples demonstrate different approaches to managing conversation history and session state in Agent Framework.
+This sample demonstrates how to discover **Agent Skills served over MCP** with an `Agent`.
 
-## Samples
+## What it demonstrates
 
-| File | Description |
-|------|-------------|
-| [`suspend_resume_session.py`](suspend_resume_session.py) | Suspend and resume conversation sessions, comparing service-managed sessions (Microsoft Foundry) with in-memory sessions (OpenAI). |
-| [`custom_history_provider.py`](custom_history_provider.py) | Implement a custom history provider by extending `HistoryProvider`, enabling conversation persistence in your preferred storage backend. |
-| [`file_history_provider.py`](file_history_provider.py) | Use the experimental `FileHistoryProvider` with `FoundryChatClient` and a function tool so the local JSON Lines file shows the full tool-calling loop. |
-| [`file_history_provider_conversation_persistence.py`](file_history_provider_conversation_persistence.py) | Persist a tool-driven weather conversation with `FileHistoryProvider`, inspect the stored JSONL records, and continue with another city. |
-| [`cosmos_history_provider.py`](cosmos_history_provider.py) | Use Azure Cosmos DB as a history provider for durable conversation storage with `CosmosHistoryProvider`. |
-| [`cosmos_history_provider_conversation_persistence.py`](cosmos_history_provider_conversation_persistence.py) | Persist and resume conversations across application restarts using `CosmosHistoryProvider` — serialize session state, restore it, and continue with full Cosmos DB history. |
-| [`cosmos_history_provider_messages.py`](cosmos_history_provider_messages.py) | Direct message history operations — retrieve stored messages as a transcript, clear session history, and verify data deletion. |
-| [`cosmos_history_provider_sessions.py`](cosmos_history_provider_sessions.py) | Multi-session and multi-tenant management — per-tenant session isolation, `list_sessions()` to enumerate, switch between sessions, and resume specific conversations. |
-| [`redis_history_provider.py`](redis_history_provider.py) | Use Redis as a history provider for persistent conversation history storage across sessions. |
+- Connecting to a remote MCP server (over streamable HTTP) that exposes skill
+  resources following the SEP-2640 convention.
+- Building a `SkillsProvider` from an `MCPSkillsSource`, which reads
+  `skill://index.json` (SEP-2640 canonical discovery) and constructs skills from
+  the index entries.
+- The progressive disclosure pattern across MCP: advertise → load → read
+  resources, exactly as for filesystem-backed skills.
 
-## Prerequisites
+> `MCPSkillsSource` supports both index entry types — `skill-md` (the `SKILL.md`
+> body and sibling resources are fetched on demand) and `archive` (a single ZIP /
+> TAR / gzip-TAR resource, unpacked in memory and served like a file-based skill).
+> Which ones you see depends on what the MCP server advertises; this sample simply
+> consumes whatever the server returns.
 
-**For `suspend_resume_session.py`:**
-- `FOUNDRY_PROJECT_ENDPOINT`: Your Microsoft Foundry project endpoint (service-managed session)
-- `FOUNDRY_MODEL`: The Foundry model deployment name
-- `OPENAI_API_KEY`: Your OpenAI API key (in-memory session)
+## Running the Sample
+
+### Prerequisites
+
+- Python 3.10+
+- A [Microsoft Foundry](https://ai.azure.com/) project with a deployed model
 - Azure CLI authentication (`az login`)
+- A running MCP server that hosts SEP-2640 skill resources (see "Providing
+  an MCP server" below)
 
-**For `custom_history_provider.py`:**
-- `OPENAI_API_KEY`: Your OpenAI API key
+### Setup
 
-**For `file_history_provider.py`:**
-- `FOUNDRY_PROJECT_ENDPOINT`: Your Microsoft Foundry project endpoint
-- `FOUNDRY_MODEL`: The Foundry model deployment name
-- Azure CLI authentication (`az login`)
-- The sample writes plaintext JSONL conversation logs to disk; use a trusted
-  local directory and avoid treating the history files as secure secret storage
+Set the following environment variables (in a `.env` file or your shell):
 
-**For `file_history_provider_conversation_persistence.py`:**
-- `FOUNDRY_PROJECT_ENDPOINT`: Your Microsoft Foundry project endpoint
-- `FOUNDRY_MODEL`: The Foundry model deployment name
-- Azure CLI authentication (`az login`)
-- The sample writes plaintext JSONL conversation logs to disk; use a trusted
-  local directory and avoid treating the history files as secure secret storage
+```powershell
+$env:FOUNDRY_PROJECT_ENDPOINT="https://your-endpoint.services.ai.azure.com/api/projects/your-project"
+$env:FOUNDRY_MODEL="gpt-4o-mini"
+$env:MCP_SKILLS_SERVER_URL="https://your-mcp-server.example.com/mcp"
+```
 
-**For Cosmos DB samples (`cosmos_history_provider*.py`):**
-- `FOUNDRY_PROJECT_ENDPOINT`: Your Microsoft Foundry project endpoint
-- `FOUNDRY_MODEL`: The Foundry model deployment name
-- `AZURE_COSMOS_ENDPOINT`: Your Azure Cosmos DB account endpoint
-- `AZURE_COSMOS_DATABASE_NAME`: The database that stores conversation history
-- `AZURE_COSMOS_CONTAINER_NAME`: The container that stores conversation history
-- Either `AZURE_COSMOS_KEY` or Azure CLI authentication (`az login`)
+### Run
 
-**For `redis_history_provider.py`:**
-- `OPENAI_API_KEY`: Your OpenAI API key
-- A running Redis server — default URL is `redis://localhost:6379`
-  - Override via the `REDIS_URL` environment variable for remote or authenticated instances
-  - Quickstart with Docker: `docker run -d --name redis-stack -p 6379:6379 redis/redis-stack-server:latest`
+```powershell
+python mcp_based_skill.py
+```
+
+## Providing an MCP server
+
+This sample is a **consumer**: it does not host an MCP server itself. To try
+it end-to-end you need an MCP server that exposes the SEP-2640 skill
+resources (`skill://index.json` plus per-skill `SKILL.md` for `skill-md`
+entries and/or a downloadable archive resource for `archive` entries).
+
+- See [`samples/02-agents/mcp/agent_as_mcp_server.py`](../../mcp/agent_as_mcp_server.py)
+  for an example of hosting an MCP server via the Agent Framework.
+- The Model Context Protocol working group maintains reference MCP-skills
+  servers at
+  [`modelcontextprotocol/experimental-ext-skills`](https://github.com/modelcontextprotocol/experimental-ext-skills).
+
+## Security Considerations
+
+Discovering skills over MCP means an *external* MCP server controls what skill content
+(including instructions and, for script-capable skills, the scripts the agent may run)
+reaches the agent. A compromised or untrustworthy server could return adversarial content
+designed to manipulate the agent (indirect prompt injection) or to exfiltrate data through
+skill instructions/scripts. This source is never enabled by default — connecting
+`MCPSkillsSource` to a server is an explicit opt-in. Only connect to MCP servers you have
+vetted and trust, and treat their responses as untrusted input.

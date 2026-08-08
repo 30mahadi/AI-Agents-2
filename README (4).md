@@ -1,48 +1,66 @@
-# Azure Provider Samples
+# Agent Skills Samples
 
-This folder contains Azure-backed samples for the generic OpenAI clients in
-`agent_framework.openai`.
+These samples demonstrate how to use **Agent Skills** — modular packages of instructions, resources, and scripts that extend an agent's capabilities. Skills follow the [Agent Skills specification](https://agentskills.io/) and use progressive disclosure to optimize token usage.
 
-## Chat Completions API samples (`OpenAIChatCompletionClient`)
+## Learning Path
 
-| File | Description |
-|------|-------------|
-| [`openai_chat_completion_client_basic.py`](openai_chat_completion_client_basic.py) | Basic Azure chat completions sample using explicit Azure settings and `credential=AzureCliCredential()`. |
-| [`openai_chat_completion_client_with_explicit_settings.py`](openai_chat_completion_client_with_explicit_settings.py) | Azure chat completions sample with explicit settings. |
-| [`openai_chat_completion_client_with_function_tools.py`](openai_chat_completion_client_with_function_tools.py) | Azure chat completions sample with function tools. |
-| [`openai_chat_completion_client_with_session.py`](openai_chat_completion_client_with_session.py) | Azure chat completions sample with session management. |
+Start with file-based or code-defined skills, then explore combining them and adding approval workflows.
 
-## Responses API samples (`OpenAIChatClient`)
+| Sample | Description |
+|--------|-------------|
+| [**file_based_skill**](file_based_skill/) | Define skills as `SKILL.md` files on disk with reference documents and executable scripts. Uses the unit-converter skill. |
+| [**code_defined_skill**](code_defined_skill/) | Define skills entirely in Python code using `Skill`, `@skill.resource`, and `@skill.script` decorators. Uses a code-defined unit-converter skill. |
+| [**class_based_skill**](class_based_skill/) | Define skills as Python classes using `ClassSkill` with `@ClassSkill.resource` and `@ClassSkill.script` decorators for auto-discovery. Uses a class-based unit-converter skill. |
+| [**mixed_skills**](mixed_skills/) | Combine code-defined, class-based, and file-based skills in a single agent. Uses a code-defined volume-converter, a class-based temperature-converter, and a file-based unit-converter. |
+| [**mcp_based_skill**](mcp_based_skill/) | Discover skills served over the [Model Context Protocol (MCP)](https://modelcontextprotocol.io) via `MCPSkillsSource`. Connects to a remote MCP server that exposes skills as `skill://...` resources following the SEP-2640 convention. |
+| [**script_approval**](script_approval/) | Require manual human-in-the-loop approval before running skill tools (the default). |
+| [**skills_auto_approval**](skills_auto_approval/) | Configure auto-approval rules with `ToolApprovalMiddleware` so read-only skill tools are approved automatically while script execution still prompts. |
 
-| File | Description |
-|------|-------------|
-| [`openai_client_basic.py`](openai_client_basic.py) | Basic Azure responses sample using explicit settings and `credential=AzureCliCredential()`. |
-| [`openai_client_with_function_tools.py`](openai_client_with_function_tools.py) | Azure responses sample with function tools. |
-| [`openai_client_with_session.py`](openai_client_with_session.py) | Azure responses sample with session management. |
-| [`openai_client_with_structured_output.py`](openai_client_with_structured_output.py) | Azure responses sample with structured output. |
+## Key Concepts
 
-## Environment Variables
+### Progressive Disclosure
 
-Set these before running the Azure provider samples:
+Skills use a three-step interaction model to minimize token usage:
 
-- `AZURE_OPENAI_ENDPOINT`
-- `AZURE_OPENAI_MODEL`
+1. **Advertise** — Skill names and descriptions (~100 tokens each) are injected into the system prompt
+2. **Load** — Full instructions are loaded on-demand via the `load_skill` tool
+3. **Access** — Resources are read via `read_skill_resource`; scripts are executed via `run_skill_script`
 
-Optionally, you can also set:
+### File-Based vs Code-Defined vs Class-Based Skills
 
-- `AZURE_OPENAI_API_KEY`
-- `AZURE_OPENAI_API_VERSION`
-- `AZURE_OPENAI_BASE_URL`
+| Aspect | File-Based | Code-Defined | Class-Based |
+|--------|-----------|--------------|-------------|
+| Definition | `SKILL.md` files on disk | `Skill` instances in Python | Classes extending `ClassSkill` |
+| Resources | Static files in `references/` and `assets/` directories | Callable functions via `@skill.resource` decorator | `@ClassSkill.resource` decorator (auto-discovered) |
+| Scripts | Python files in `scripts/` directory (executed via subprocess) | Callable functions via `@skill.script` decorator (executed in-process) | `@ClassSkill.script` decorator (executed in-process) |
+| Discovery | Automatic via `skill_paths` parameter | Explicit via `skills` parameter | Explicit via `skills` parameter |
+| Dynamic content | No (static files only) | Yes (functions can generate content at runtime) | Yes (functions can generate content at runtime) |
+| Sharing pattern | Copy skill directory | Inline or shared instances | Package in shared libraries/PyPI |
 
-These Azure samples are written around explicit Azure inputs such as
-`credential=AzureCliCredential()`, so they stay on Azure even if `OPENAI_API_KEY` is also present.
+All three types can be combined in a single `SkillsProvider` — see the [mixed_skills](mixed_skills/) sample.
 
-## Optional Dependencies
+### Script Execution
 
-Credential-based samples require `azure-identity`:
+Skills can include executable scripts. How a script runs depends on how it was defined:
 
-```bash
-pip install azure-identity
-```
+| | Code-Defined Scripts | File-Based Scripts |
+|---|---|---|
+| **Defined via** | `@skill.script` decorator | `.py` files in `scripts/` directory |
+| **Execution** | In-process (direct function call) | Delegated to a `script_runner` |
+| **`script_runner` needed?** | No — runs in-process automatically | **Yes** — required |
 
-Run `az login` before executing the credential-based samples.
+The `script_runner` parameter on `SkillsProvider` is only applicable to **file-based** scripts. Code-defined scripts are always executed in-process regardless of this setting. See [file_based_skill](file_based_skill/) for an example using a `SkillScriptRunner` callable with a subprocess runner, and [code_defined_skill](code_defined_skill/) for in-process scripts that need no runner.
+
+## Prerequisites
+
+All samples require:
+- A [Microsoft Foundry](https://ai.azure.com/) project with a deployed model (e.g. `gpt-4o-mini`)
+- Azure CLI authentication (`az login`)
+- Environment variables set in a `.env` file (see `python/.env.example`)
+
+## Suppressing the experimental MCP Skills warning
+
+The core Agent Skills APIs are stable. MCP-based skill discovery
+(`MCPSkillsSource`) is still experimental, so the [mcp_based_skill](mcp_based_skill/)
+sample includes a short commented `warnings.filterwarnings(...)` snippet near the
+imports. Uncomment it if you want to suppress the MCP Skills warning.
