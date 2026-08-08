@@ -1,178 +1,324 @@
-# agent-framework-monty
+## Microsoft Agent Framework – Purview Integration (Python)
 
-Monty-backed CodeAct integrations for Microsoft Agent Framework.
+`agent-framework-purview` adds Microsoft Purview (Microsoft Graph dataSecurityAndGovernance) policy evaluation to the Microsoft Agent Framework. It lets you enforce data security / governance policies on both the *prompt* (user input + conversation history) and the *model response* before they proceed further in your workflow.
 
-> [!WARNING]
-> This package is in **beta**. APIs may change before its stable release. It is
-> included in `agent-framework[all]`.
+> Status: **Preview**
 
-## Installation
+### Key Features
 
-```bash
-pip install agent-framework-monty --pre
-```
+- Middleware-based policy enforcement (agent-level and chat-client level)
+- Blocks or allows content at both ingress (prompt) and egress (response)
+- Works with any `Agent` / agent orchestration using the standard Agent Framework middleware pipeline
+- Supports both synchronous `TokenCredential` and `AsyncTokenCredential` from `azure-identity`
+- Configuration via `PurviewSettings` / `PurviewAppLocation`
+- Built-in caching with configurable TTL and size limits for protection scopes in `PurviewSettings`
+- Background processing for content activities and offline policy evaluation
 
-The package depends on [`pydantic-monty`](https://github.com/pydantic/monty), a
-Rust-based Python interpreter, so it runs on Linux, macOS, and Windows wherever
-Monty wheels are published — no hypervisor or WASM backend required.
+### When to Use
+Add Purview when you need to:
 
-## Quick start
+- **Prevent sensitive data leaks**: Inline blocking of sensitive content based on Data Loss Prevention (DLP) policies.
+- **Enable governance**: Log AI interactions in Purview for Audit, Communication Compliance, Insider Risk Management, eDiscovery, and Data Lifecycle Management.
+- Prevent sensitive or disallowed content from being sent to an LLM
+- Prevent model output containing disallowed data from leaving the system
+- Apply centrally managed policies without rewriting agent logic
 
-### Context provider (recommended)
+---
 
-Use `MontyCodeActProvider` to automatically inject the `execute_code` tool and
-CodeAct instructions into every agent run. Tools registered on the provider are
-available inside the Monty interpreter as **typed async functions** (e.g.
-`await compute(operation="add", a=1, b=2)`), and as a fallback through
-`call_tool(...)`.
+## Prerequisites
+
+- Microsoft Azure subscription with Microsoft Purview configured.
+- Microsoft 365 subscription with an E5 license and pay-as-you-go billing setup.
+  - For testing, you can use a Microsoft 365 Developer Program tenant. For more information, see [Join the Microsoft 365 Developer Program](https://learn.microsoft.com/en-us/office/developer-program/microsoft-365-developer-program).
+
+### Authentication
+
+`PurviewClient` uses the `azure-identity` library for token acquisition. You can use any `TokenCredential` or `AsyncTokenCredential` implementation.
+
+- **Entra registration**: Register your agent and add the required Microsoft Graph permissions (`dataSecurityAndGovernance`) to the Service Principal. For more information, see [Register an application in Microsoft Entra ID](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app) and [dataSecurityAndGovernance resource type](https://learn.microsoft.com/en-us/graph/api/resources/datasecurityandgovernance). You'll need the Microsoft Entra app ID in the next step.
+
+- **Graph Permissions**:
+- ProtectionScopes.Compute.All : [userProtectionScopeContainer](https://learn.microsoft.com/en-us/graph/api/userprotectionscopecontainer-compute)
+- Content.Process.All : [processContent](https://learn.microsoft.com/en-us/graph/api/userdatasecurityandgovernance-processcontent)
+- ContentActivity.Write : [contentActivity](https://learn.microsoft.com/en-us/graph/api/activitiescontainer-post-contentactivities)
+
+- **Purview policies**: Configure Purview policies using the Microsoft Entra app ID to enable agent communications data to flow into Purview. For more information, see [Configure Microsoft Purview](https://learn.microsoft.com/purview/developer/configurepurview).
+
+#### Scopes
+`PurviewSettings.get_scopes()` derives the Graph scope list (currently `https://graph.microsoft.com/.default` style).
+
+---
+
+## Quick Start
 
 ```python
-from agent_framework import Agent, tool
-from agent_framework.monty import MontyCodeActProvider
+import asyncio
+from agent_framework import Agent, Message, Role
+from agent_framework.openai import OpenAIChatCompletionClient
+from agent_framework.microsoft import PurviewPolicyMiddleware, PurviewSettings
+from azure.identity import InteractiveBrowserCredential
 
+async def main():
+	client = OpenAIChatCompletionClient()  # uses environment for endpoint + deployment
 
-@tool
-def compute(operation: str, a: float, b: float) -> float:
-    """Perform a math operation."""
-    ops = {"add": a + b, "subtract": a - b, "multiply": a * b, "divide": a / b}
-    return ops[operation]
+	purview_middleware = PurviewPolicyMiddleware(
+		credential=InteractiveBrowserCredential(),
+		settings=PurviewSettings(app_name="My Sample App")
+	)
 
+	agent = Agent(
+		client=client,
+		instructions="You are a helpful assistant.",
+		middleware=[purview_middleware]
+	)
 
-codeact = MontyCodeActProvider(
-    tools=[compute],
-    approval_mode="never_require",
+	response = await agent.run(Message("user", ["Summarize zero trust in one sentence."]))
+	print(response)
+
+asyncio.run(main())
+```
+
+If a policy violation is detected on the prompt, the middleware terminates the run and substitutes a system message: `"Prompt blocked by policy"`. If on the response, the result becomes `"Response blocked by policy"`.
+
+---
+
+## Configuration
+
+### `PurviewSettings`
+
+```python
+PurviewSettings(
+    app_name="My App",                         # Required: Display / logical name
+    app_version=None,                          # Optional: Version string of the application
+    tenant_id=None,                            # Optional: Tenant id (guid), used mainly for auth context
+    purview_app_location=None,                 # Optional: PurviewAppLocation for scoping
+    graph_base_uri="https://graph.microsoft.com/v1.0/",
+    blocked_prompt_message="Prompt blocked by policy",      # Custom message for blocked prompts
+    blocked_response_message="Response blocked by policy",  # Custom message for blocked responses
+    ignore_exceptions=False,                   # If True, non-payment exceptions are logged but not thrown
+    ignore_payment_required=False,             # If True, 402 payment required errors are logged but not thrown
+    cache_ttl_seconds=14400,                   # Cache TTL in seconds (default 4 hours)
+    max_cache_size_bytes=200 * 1024 * 1024     # Max cache size in bytes (default 200MB)
 )
+```
+
+### Caching
+
+The Purview integration includes built-in caching for protection scopes responses to improve performance and reduce API calls:
+
+- **Default TTL**: 4 hours (14400 seconds)
+- **Default Cache Size**: 200MB
+- **Cache Provider**: `InMemoryCacheProvider` is used by default, but you can provide a custom implementation via the `CacheProvider` protocol
+- **Cache Invalidation**: Cache is automatically invalidated when protection scope state is modified
+- **Exception Caching**: 402 Payment Required errors are cached to avoid repeated failed API calls
+
+You can customize caching behavior in `PurviewSettings`:
+
+```python
+from agent_framework.microsoft import PurviewSettings
+
+settings = PurviewSettings(
+    app_name="My App",
+    cache_ttl_seconds=14400,           # 4 hours
+    max_cache_size_bytes=200 * 1024 * 1024  # 200MB
+)
+```
+
+Or provide your own cache provider:
+
+```python
+from typing import Any
+from agent_framework.microsoft import PurviewPolicyMiddleware, PurviewSettings, CacheProvider
+from azure.identity import DefaultAzureCredential
+
+class MyCustomCache(CacheProvider):
+    async def get(self, key: str) -> Any | None:
+        # Your implementation
+        pass
+
+    async def set(self, key: str, value: Any, ttl_seconds: int | None = None) -> None:
+        # Your implementation
+        pass
+
+    async def remove(self, key: str) -> None:
+        # Your implementation
+        pass
+
+credential = DefaultAzureCredential()
+settings = PurviewSettings(app_name="MyApp")
+
+middleware = PurviewPolicyMiddleware(
+    credential=credential,
+    settings=settings,
+    cache_provider=MyCustomCache()
+)
+```
+
+To scope evaluation by location (application, URL, or domain):
+
+```python
+from agent_framework.microsoft import (
+	PurviewAppLocation,
+	PurviewLocationType,
+	PurviewSettings,
+)
+
+settings = PurviewSettings(
+	app_name="Contoso Support",
+	purview_app_location=PurviewAppLocation(
+		location_type=PurviewLocationType.APPLICATION,
+		location_value="<app-client-id>"
+	)
+)
+```
+
+### Customizing Blocked Messages
+
+By default, when Purview blocks a prompt or response, the middleware returns a generic system message. You can customize these messages by providing your own text in the `PurviewSettings`:
+
+```python
+from agent_framework.microsoft import PurviewSettings
+
+settings = PurviewSettings(
+	app_name="My App",
+	blocked_prompt_message="Your request contains content that violates our policies. Please rephrase and try again.",
+	blocked_response_message="The response was blocked due to policy restrictions. Please contact support if you need assistance."
+)
+```
+
+### Exception Handling Controls
+
+The Purview integration provides fine-grained control over exception handling to support graceful degradation scenarios:
+
+```python
+from agent_framework.microsoft import PurviewSettings
+
+# Ignore all non-payment exceptions (continue execution even if policy check fails)
+settings = PurviewSettings(
+    app_name="My App",
+    ignore_exceptions=True  # Log errors but don't throw
+)
+
+# Ignore only 402 Payment Required errors (useful for tenants without proper licensing)
+settings = PurviewSettings(
+    app_name="My App",
+    ignore_payment_required=True  # Continue even without Purview Consumptive Billing Setup
+)
+
+# Both can be combined
+settings = PurviewSettings(
+    app_name="My App",
+    ignore_exceptions=True,
+    ignore_payment_required=True
+)
+```
+
+### Selecting Agent vs Chat Middleware
+
+Use the agent middleware when you already have / want the full agent pipeline:
+
+```python
+from agent_framework import Agent
+from agent_framework.openai import OpenAIChatCompletionClient
+from agent_framework.microsoft import PurviewPolicyMiddleware, PurviewSettings
+from azure.identity import DefaultAzureCredential
+
+credential = DefaultAzureCredential()
+client = OpenAIChatCompletionClient()
 
 agent = Agent(
-    client=client,
-    name="CodeActAgent",
-    instructions="You are a helpful assistant.",
-    context_providers=[codeact],
+	client=client,
+	instructions="You are helpful.",
+	middleware=[PurviewPolicyMiddleware(credential, PurviewSettings(app_name="My App"))]
 )
-
-result = await agent.run("Multiply 6 by 7 using execute_code.")
 ```
 
-### Standalone tool
-
-Use `MontyExecuteCodeTool` directly when you want full control over how the
-tool is added to the agent (e.g. when mixing sandbox tools with direct-only
-tools on the same agent).
+Use the chat middleware when you attach directly to a chat client (e.g. minimal agent shell or custom orchestration):
 
 ```python
-from agent_framework import Agent, tool
-from agent_framework.monty import MontyExecuteCodeTool
+import os
+from agent_framework import Agent
+from agent_framework.openai import OpenAIChatCompletionClient
+from agent_framework.microsoft import PurviewChatPolicyMiddleware, PurviewSettings
+from azure.identity import DefaultAzureCredential
 
+credential = DefaultAzureCredential()
 
-@tool
-def send_email(to: str, subject: str, body: str) -> str:
-    """Send an email (direct-only, not available inside the sandbox)."""
-    return f"Email sent to {to}"
-
-
-execute_code = MontyExecuteCodeTool(
-    tools=[compute],
-    approval_mode="never_require",
+client = OpenAIChatCompletionClient(
+	model=os.environ["AZURE_OPENAI_MODEL"],
+	azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+	credential=credential,
+	middleware=[
+		PurviewChatPolicyMiddleware(credential, PurviewSettings(app_name="My App (Chat)"))
+	],
 )
 
-agent = Agent(
-    client=client,
-    name="MixedToolsAgent",
-    instructions="You are a helpful assistant.",
-    tools=[send_email, execute_code],
-)
+agent = Agent(client=client, instructions="You are helpful.")
 ```
 
-### Manual static wiring
+The policy logic is identical; the difference is only the hook point in the pipeline.
 
-For fixed configurations where provider lifecycle overhead is unnecessary,
-build the CodeAct instructions once and pass them to the agent at construction
-time:
+---
 
-```python
-execute_code = MontyExecuteCodeTool(
-    tools=[compute],
-    approval_mode="never_require",
-)
+## Middleware Lifecycle
 
-codeact_instructions = execute_code.build_instructions(tools_visible_to_model=False)
+1. **Before agent execution** (`prompt phase`): all `context.messages` are evaluated.
+   - If no valid user_id is found, processing is skipped (no policy evaluation)
+   - Protection scopes are retrieved (with caching)
+   - Applicable scopes are checked to determine execution mode
+   - In inline mode: content is evaluated immediately
+   - In offline mode: evaluation is queued in background
+2. **If blocked**: `context.result` is replaced with a system message and `context.terminate = True`.
+3. **After successful agent execution** (`response phase`): the produced messages are evaluated using the same user_id from the prompt phase.
+4. **If blocked**: result messages are replaced with a blocking notice.
 
-agent = Agent(
-    client=client,
-    name="StaticWiringAgent",
-    instructions=f"You are a helpful assistant.\n\n{codeact_instructions}",
-    tools=[execute_code],
-)
-```
+The user identifier is discovered from `Message.additional_properties['user_id']` during the prompt phase and reused for the response phase, ensuring both evaluations map consistently to the same user. If no user_id is present, policy evaluation is skipped entirely.
 
-### File mounts and resource limits
+You can customize the blocking messages using the `blocked_prompt_message` and `blocked_response_message` fields in `PurviewSettings`. For more advanced scenarios, you can wrap the middleware or post-process `context.result` in later middleware.
 
-Mount host directories into the sandbox and cap execution resources:
+---
 
-```python
-from agent_framework.monty import FileMount, MontyCodeActProvider
+## Exceptions
 
-codeact = MontyCodeActProvider(
-    tools=[compute],
-    workspace_root="/host/workspace",       # auto-mounted at /input (read-write)
-    file_mounts=[
-        "/host/data",                                                # shorthand: same path on both sides
-        ("/host/models", "/sandbox/models"),                          # explicit (host, mount_path)
-        FileMount(                                                    # full control
-            host_path="/host/cache",
-            mount_path="/sandbox/cache",
-            mode="overlay",                # "read-only" | "read-write" | "overlay"
-            write_bytes_limit=10 * 1024 * 1024,
-        ),
-    ],
-    resource_limits={                       # Monty ResourceLimits TypedDict
-        "max_duration_secs": 5.0,
-        "max_memory": 64 * 1024 * 1024,
-    },
-)
-```
-
-- **`workspace_root`** mirrors the Hyperlight default: the directory is mounted
-  at `/input` in `read-write` mode.
-- **`file_mounts`** accepts a string shorthand, a `(host_path, mount_path)`
-  tuple, or a `FileMount` named tuple (with optional `mode` and
-  `write_bytes_limit`).
-- Files written by the sandbox to any **`read-write`** mount are scanned
-  after each `execute_code` call and returned as `Content.from_data(...)`
-  attachments (with a `path` annotation in `additional_properties`),
-  mirroring Hyperlight's `/output` flow.
-- `overlay` mounts buffer writes in memory (nothing leaks to the host and
-  nothing is captured). `read-only` mounts reject writes.
-- **`resource_limits`** is forwarded straight to Monty's
-  [`ResourceLimits`](https://github.com/pydantic/monty) TypedDict
-  (`max_allocations`, `max_duration_secs`, `max_memory`, `gc_interval`,
-  `max_recursion_depth`).
-
-## DSL inside `execute_code`
-
-The model generates Python code that runs inside Monty's Rust-based interpreter.
-Available primitives:
-
-| Primitive | Behavior |
+| Exception | Scenario |
 |-----------|----------|
-| `await tool_name(**kwargs)` | Direct typed call to a registered host tool. Argument types are checked before execution. |
-| `await call_tool("name", **kwargs)` | Generic fallback that dispatches by tool name. Not type-checked. |
-| `asyncio.gather(...)` | Fans out concurrent tool calls. |
-| `print(...)` | Captured and surfaced as text in the tool result. |
+| `PurviewPaymentRequiredError` | 402 Payment Required - tenant lacks proper Purview licensing or consumptive billing setup |
+| `PurviewAuthenticationError` | Token acquisition / validation issues |
+| `PurviewRateLimitError` | 429 responses from service |
+| `PurviewRequestError` | 4xx client errors (bad input, unauthorized, forbidden) |
+| `PurviewServiceError` | 5xx or unexpected service errors |
+
+### Exception Handling
+
+All exceptions inherit from `PurviewServiceError`. You can catch specific exceptions or use the base class:
+
+```python
+from agent_framework.microsoft import (
+    PurviewPaymentRequiredError,
+    PurviewAuthenticationError,
+    PurviewRateLimitError,
+    PurviewRequestError,
+    PurviewServiceError
+)
+
+try:
+    # Your code here
+    pass
+except PurviewPaymentRequiredError as ex:
+    # Handle licensing issues specifically
+    print(f"Purview licensing required: {ex}")
+except (PurviewAuthenticationError, PurviewRateLimitError, PurviewRequestError, PurviewServiceError) as ex:
+    # Handle other errors
+    print(f"Purview enforcement skipped: {ex}")
+```
+
+---
 
 ## Notes
-
-- `MontyCodeActProvider` and `MontyExecuteCodeTool` mirror the API surface of
-  the `agent-framework-hyperlight` counterparts where the underlying runtime
-  supports it.
-- Monty interprets a **subset** of Python (a Rust-based interpreter). Most
-  control flow, common stdlib modules (`sys`, `os`, `typing`, `asyncio`, `re`,
-  `datetime`, `json`), and async functions are supported, but exotic features
-  may not be available. OS-level access (filesystem, network, subprocess) is
-  rejected with `PermissionError` **by default**; mount host directories with
-  `workspace_root` / `file_mounts` to grant scoped filesystem access.
-- Code is type-checked against tool signatures via
-  [ty](https://docs.astral.sh/ty/) before execution, so wrong argument types
-  surface as a clear error before any host tool runs.
-- The beta package is part of `agent-framework[all]` and is reachable through
-  the lazy-loading namespace `agent_framework.monty`.
+- **User Identification**: When the configured credential resolves to a user token, that token's `user_id` is used for per-user policy scoping. For app-token credentials, provide a `user_id` per request (e.g. in `Message(..., additional_properties={"user_id": "<guid>"})`). If no user_id is provided or inferred, policy evaluation is skipped.
+- **Blocking Messages**: Can be customized via `blocked_prompt_message` and `blocked_response_message` in `PurviewSettings`. By default, they are "Prompt blocked by policy" and "Response blocked by policy" respectively.
+- **Streaming Responses**: Post-response policy evaluation presently applies only to non-streaming chat responses.
+- **Error Handling**: Use `ignore_exceptions` and `ignore_payment_required` settings for graceful degradation. When enabled, errors are logged but don't fail the request.
+- **Caching**: Protection scopes responses and 402 errors are cached by default with a 4-hour TTL. Cache is automatically invalidated when protection scope state changes.
+- **Cold-cache parallelization**: On a `ProtectionScopes` cache miss, scopes are refreshed in the background while `ProcessContent` runs in the foreground.
+- **Background Processing**: Content Activities and offline Process Content requests are handled asynchronously using background tasks to avoid blocking the main execution flow.

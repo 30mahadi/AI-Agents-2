@@ -4,6 +4,10 @@ from enum import IntEnum
 
 
 class FeatureIndex(IntEnum):
-    """Telegram hosting-owned feature-usage indexes."""
+    """Orchestration-owned feature-usage indexes."""
 
-    HOSTING_TELEGRAM = 87
+    ORCHESTRATION_SEQUENTIAL = 32
+    ORCHESTRATION_CONCURRENT = 33
+    ORCHESTRATION_GROUP_CHAT = 34
+    ORCHESTRATION_MAGENTIC = 35
+    ORCHESTRATION_HANDOFF = 36

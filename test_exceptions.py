@@ -1,27 +1,47 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Tests for AgentFrameworkException inner_exception handling."""
+"""Tests for Purview exceptions."""
 
-from agent_framework import AgentFrameworkException
+from agent_framework.exceptions import IntegrationException, IntegrationInvalidAuthException
 
-
-def test_exception_with_inner_exception():
-    """When inner_exception is provided, it should be set as the second arg."""
-    inner = ValueError("inner error")
-    exc = AgentFrameworkException("test message", inner_exception=inner)
-    assert exc.args[0] == "test message"
-    assert exc.args[1] is inner
-
-
-def test_exception_without_inner_exception():
-    """When inner_exception is None, args should only contain the message."""
-    exc = AgentFrameworkException("test message")
-    assert exc.args == ("test message",)
-    assert len(exc.args) == 1
+from agent_framework_purview import (
+    PurviewAuthenticationError,
+    PurviewPaymentRequiredError,
+    PurviewRateLimitError,
+    PurviewRequestError,
+    PurviewServiceError,
+)
 
 
-def test_exception_inner_exception_none_explicit():
-    """When inner_exception is explicitly None, args should only contain the message."""
-    exc = AgentFrameworkException("test message", inner_exception=None)
-    assert exc.args == ("test message",)
-    assert len(exc.args) == 1
+class TestPurviewExceptions:
+    """Test custom Purview exception classes."""
+
+    def test_purview_service_error(self) -> None:
+        """Test PurviewServiceError base exception."""
+        error = PurviewServiceError("Service error occurred")
+        assert str(error) == "Service error occurred"
+        assert isinstance(error, IntegrationException)
+
+    def test_purview_authentication_error(self) -> None:
+        """Test PurviewAuthenticationError exception."""
+        error = PurviewAuthenticationError("Authentication failed")
+        assert str(error) == "Authentication failed"
+        assert isinstance(error, IntegrationInvalidAuthException)
+
+    def test_purview_payment_required_error(self) -> None:
+        """Test PurviewPaymentRequiredError exception."""
+        error = PurviewPaymentRequiredError("Payment required")
+        assert str(error) == "Payment required"
+        assert isinstance(error, IntegrationException)
+
+    def test_purview_rate_limit_error(self) -> None:
+        """Test PurviewRateLimitError exception."""
+        error = PurviewRateLimitError("Rate limit exceeded")
+        assert str(error) == "Rate limit exceeded"
+        assert isinstance(error, IntegrationException)
+
+    def test_purview_request_error(self) -> None:
+        """Test PurviewRequestError exception."""
+        error = PurviewRequestError("Request failed")
+        assert str(error) == "Request failed"
+        assert isinstance(error, IntegrationException)

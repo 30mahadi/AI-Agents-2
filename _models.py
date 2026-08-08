@@ -1,1154 +1,1033 @@
 # Copyright (c) Microsoft. All rights reserved.
+
 from __future__ import annotations
 
 import logging
-import os
-from collections.abc import MutableMapping
-from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, cast, overload
+from collections.abc import Iterable, Mapping, MutableMapping, Sequence
+from datetime import datetime
+from enum import Enum, Flag, auto
+from typing import Any, ClassVar, TypeVar, cast
+from uuid import uuid4
 
 from agent_framework._serialization import SerializationMixin
 
-if TYPE_CHECKING:
-    from powerfx import Engine
+logger = logging.getLogger("agent_framework.purview")
 
-_engine_initialized = False
-_engine: Engine | None = None
-
-
-def _get_engine() -> Engine | None:
-    """Lazily initialize the PowerFx engine on first use."""
-    global _engine_initialized, _engine
-    if not _engine_initialized:
-        _engine_initialized = True
-        try:
-            from powerfx import Engine
-
-            _engine = Engine()
-        except (ImportError, RuntimeError):
-            # ImportError: powerfx package not installed
-            # RuntimeError: .NET runtime not available or misconfigured
-            pass
-    return _engine
+# --------------------------------------------------------------------------------------
+# Enums & flag helpers
+# --------------------------------------------------------------------------------------
 
 
-logger = logging.getLogger("agent_framework.declarative")
+class Activity(str, Enum):
+    """High-level activity types representing user or agent operations."""
 
-# Context variable for safe_mode setting.
-# When True (default), environment variables are NOT accessible in PowerFx expressions.
-# When False, environment variables CAN be accessed via Env symbol in PowerFx.
-_safe_mode_context: ContextVar[bool] = ContextVar("safe_mode", default=True)
-
-
-@overload
-def _try_powerfx_eval(value: None, log_value: bool = True) -> None: ...
+    UNKNOWN = "unknown"
+    UPLOAD_TEXT = "uploadText"
+    UPLOAD_FILE = "uploadFile"
+    DOWNLOAD_TEXT = "downloadText"
+    DOWNLOAD_FILE = "downloadFile"
 
 
-@overload
-def _try_powerfx_eval(value: str, log_value: bool = True) -> str: ...
+class ProtectionScopeActivities(Flag):
+    """Flag enumeration of activities used in policy protection scopes."""
+
+    NONE = 0
+    UPLOAD_TEXT = auto()
+    UPLOAD_FILE = auto()
+    DOWNLOAD_TEXT = auto()
+    DOWNLOAD_FILE = auto()
+    UNKNOWN_FUTURE_VALUE = auto()
+
+    def __int__(self) -> int:  # pragma: no cover
+        return self.value
 
 
-def _try_powerfx_eval(value: str | None, log_value: bool = True) -> str | None:
-    """Check if a value refers to a environment variable and parse it if so.
+FlagT = TypeVar("FlagT", bound=Flag)
 
-    Args:
-        value: The value to check.
-        log_value: Whether to log additional context on error.
-    """
-    if value is None:
-        return value
-    if not value.startswith("="):
-        return value
-    engine = _get_engine()
-    if engine is None:
-        logger.warning(
-            "PowerFx engine not available for evaluating values starting with '='. "
-            "Ensure you are on python 3.13 or less and have the powerfx package installed. "
-            "Otherwise replace all powerfx statements in your yaml with strings."
-        )
-        return value
-    try:
-        safe_mode = _safe_mode_context.get()
-        if safe_mode:
-            return engine.eval(value[1:])
-        return engine.eval(value[1:], symbols={"Env": dict(os.environ)})
-    except Exception as exc:
-        if log_value:
-            logger.debug("PowerFx evaluation failed for a value: %s", exc)
-        else:
-            logger.debug("PowerFx evaluation failed for a value (details redacted): %s", exc)
-        return value
-
-
-class Binding(SerializationMixin):
-    """Object representing a tool argument binding."""
-
-    def __init__(
-        self,
-        name: str | None = None,
-        input: str | None = None,
-    ) -> None:
-        self.name = _try_powerfx_eval(name)
-        self.input = _try_powerfx_eval(input)
-
-
-class Property(SerializationMixin):
-    """Object representing a property in a schema."""
-
-    def __init__(
-        self,
-        name: str | None = None,
-        kind: str | None = None,
-        description: str | None = None,
-        required: bool | None = None,
-        default: Any | None = None,
-        example: Any | None = None,
-        enum: list[Any] | None = None,
-    ) -> None:
-        self.name = _try_powerfx_eval(name)
-        self.kind = _try_powerfx_eval(kind)
-        self.description = _try_powerfx_eval(description)
-        self.required = required
-        self.default = default
-        self.example = example
-        self.enum = enum or []
-
-    @classmethod
-    def from_dict(
-        cls, value: MutableMapping[str, Any], /, *, dependencies: MutableMapping[str, Any] | None = None
-    ) -> Property:
-        """Create a Property instance from a dictionary, dispatching to the appropriate subclass."""
-        # Only dispatch if we're being called on the base Property class
-        if cls is not Property:
-            # We're being called on a subclass, use the normal from_dict
-            return SerializationMixin.from_dict.__func__(cls, value, dependencies=dependencies)
-
-        # The YAML spec uses 'type' for the data type, but Property stores it as 'kind'
-        if "type" in value:
-            if "kind" not in value:
-                value["kind"] = value.pop("type")
-            else:
-                value.pop("type")
-        kind = value.get("kind", "")
-        if kind == "array":
-            return ArrayProperty.from_dict(value, dependencies=dependencies)
-        if kind == "object":
-            return ObjectProperty.from_dict(value, dependencies=dependencies)
-        # Default to Property for kind="property" or empty
-        return SerializationMixin.from_dict.__func__(cls, value, dependencies=dependencies)
-
-
-class ArrayProperty(Property):
-    """Object representing an array property."""
-
-    def __init__(
-        self,
-        name: str | None = None,
-        kind: str = "array",
-        description: str | None = None,
-        required: bool | None = None,
-        default: Any | None = None,
-        example: Any | None = None,
-        enum: list[Any] | None = None,
-        items: Property | None = None,
-    ) -> None:
-        super().__init__(
-            name=name,
-            kind=kind,
-            description=description,
-            required=required,
-            default=default,
-            example=example,
-            enum=enum,
-        )
-        if not isinstance(items, Property) and items is not None:
-            items = Property.from_dict(items)
-        self.items = items
-
-
-class ObjectProperty(Property):
-    """Object representing an object property."""
-
-    def __init__(
-        self,
-        name: str | None = None,
-        kind: str = "object",
-        description: str | None = None,
-        required: bool | None = None,
-        default: Any | None = None,
-        example: Any | None = None,
-        enum: list[Any] | None = None,
-        properties: list[Property] | dict[str, dict[str, Any]] | None = None,
-    ) -> None:
-        super().__init__(
-            name=name,
-            kind=kind,
-            description=description,
-            required=required,
-            default=default,
-            example=example,
-            enum=enum,
-        )
-        converted_properties: list[Property] = []
-        if isinstance(properties, list):
-            for prop in properties:
-                if not isinstance(prop, Property):
-                    prop = Property.from_dict(prop)
-                converted_properties.append(prop)
-        elif isinstance(properties, dict):
-            for k, v in properties.items():
-                temp_prop = {"name": k, **v}
-                prop = Property.from_dict(temp_prop)
-                converted_properties.append(prop)
-        self.properties = converted_properties
-
-
-def _normalize_nested_schemas(node: dict[str, Any]) -> None:
-    """Recursively convert a node's nested schemas to JSON Schema form.
-
-    Nested schemas (array ``items``, object ``properties``) keep the declarative
-    shape after serialization: ``kind`` instead of ``type``, empty ``enum``
-    placeholders, and object properties as a list of ``{"name": ..., ...}``
-    entries. OpenAI rejects schemas whose nested nodes lack a ``type`` key, so
-    apply the same conversion the top-level properties loop performs.
-    """
-    items = node.get("items")
-    if isinstance(items, dict):
-        _normalize_schema_node(cast("dict[str, Any]", items))
-    props = node.get("properties")
-    if not isinstance(props, list):
-        return
-    # Serialized PropertySchema shape: [{"name": ..., "kind": ..., ...}, ...].
-    # Validate every element BEFORE mutating any, so an unexpected shape
-    # leaves the node fully untouched rather than half-converted.
-    if not all(isinstance(prop, dict) and "name" in prop for prop in cast("list[Any]", props)):
-        return
-    new_props: dict[str, Any] = {}
-    required_fields: list[str] = []
-    for prop in cast("list[dict[str, Any]]", props):
-        prop_name = prop.pop("name")
-        if prop.pop("required", False):
-            required_fields.append(prop_name)
-        _normalize_schema_node(prop)
-        new_props[prop_name] = prop
-    node["properties"] = new_props
-    if required_fields:
-        node["required"] = required_fields
-
-
-def _normalize_schema_node(node: dict[str, Any]) -> None:
-    """Rename ``kind`` -> ``type``, drop empty ``enum``, and recurse into children."""
-    if "kind" in node:
-        node["type"] = node.pop("kind")
-    if not node.get("enum"):
-        node.pop("enum", None)
-    if node.get("type") == "object":
-        # OpenAI strict structured outputs require additionalProperties: false on
-        # every object node; chat clients only inject it at the schema root.
-        node.setdefault("additionalProperties", False)
-    _normalize_nested_schemas(node)
-
-
-class PropertySchema(SerializationMixin):
-    """Object representing a property schema."""
-
-    def __init__(
-        self,
-        examples: list[dict[str, Any]] | None = None,
-        strict: bool = False,
-        properties: list[Property] | dict[str, dict[str, Any]] | None = None,
-    ) -> None:
-        self.examples = examples or []
-        self.strict = strict
-        converted_properties: list[Property] = []
-        if isinstance(properties, list):
-            for prop in properties:
-                if not isinstance(prop, Property):
-                    prop = Property.from_dict(prop)
-                converted_properties.append(prop)
-        elif isinstance(properties, dict):
-            for k, v in properties.items():
-                temp_prop = {"name": k, **v}
-                prop = Property.from_dict(temp_prop)
-                converted_properties.append(prop)
-        self.properties = converted_properties
-
-    @classmethod
-    def from_dict(
-        cls, value: MutableMapping[str, Any], /, *, dependencies: MutableMapping[str, Any] | None = None
-    ) -> PropertySchema:
-        """Create a PropertySchema instance from a dictionary, filtering out 'kind' field."""
-        # Filter out 'kind', 'type', 'name', and 'description' fields that may appear in YAML
-        # but aren't PropertySchema params
-        kwargs = {k: v for k, v in value.items() if k not in ("type", "kind", "name", "description")}
-        return SerializationMixin.from_dict.__func__(cls, kwargs, dependencies=dependencies)
-
-    def to_json_schema(self) -> dict[str, Any]:
-        """Get a schema out of this PropertySchema to create pydantic models."""
-        json_schema = self.to_dict(exclude={"type"}, exclude_none=True)
-        new_props = {}
-        required_fields: list[str] = []
-        for prop in json_schema.get("properties", []):
-            prop_name = prop.pop("name")
-            # Convert property-level 'required' boolean to a top-level 'required' array
-            if prop.pop("required", False):
-                required_fields.append(prop_name)
-            _normalize_schema_node(prop)
-            new_props[prop_name] = prop
-        json_schema["type"] = "object"
-        json_schema["properties"] = new_props
-        if required_fields:
-            json_schema["required"] = required_fields
-        return json_schema
-
-
-ConnectionT = TypeVar("ConnectionT", bound="Connection")
-
-
-class Connection(SerializationMixin):
-    """Object representing a connection specification."""
-
-    def __init__(
-        self,
-        kind: Literal["reference", "remote", "key", "anonymous"],
-        authenticationMode: str | None = None,
-        usageDescription: str | None = None,
-    ) -> None:
-        self.kind = kind
-        self.authenticationMode = _try_powerfx_eval(authenticationMode)
-        self.usageDescription = _try_powerfx_eval(usageDescription)
-
-    @classmethod
-    def from_dict(
-        cls: type[ConnectionT],
-        value: MutableMapping[str, Any],
-        /,
-        *,
-        dependencies: MutableMapping[str, Any] | None = None,
-    ) -> ConnectionT:
-        """Create a Connection instance from a dictionary, dispatching to the appropriate subclass."""
-        # Only dispatch if we're being called on the base Connection class
-        if cls is not Connection:
-            # We're being called on a subclass, use the normal from_dict
-            return SerializationMixin.from_dict.__func__(cls, value, dependencies=dependencies)
-
-        kind = value.get("kind", "").lower()
-        if kind == "reference":
-            return SerializationMixin.from_dict.__func__(ReferenceConnection, value, dependencies=dependencies)
-        if kind == "remote":
-            return SerializationMixin.from_dict.__func__(RemoteConnection, value, dependencies=dependencies)
-        if kind in ("key", "apikey"):
-            return SerializationMixin.from_dict.__func__(ApiKeyConnection, value, dependencies=dependencies)
-        if kind == "anonymous":
-            return SerializationMixin.from_dict.__func__(AnonymousConnection, value, dependencies=dependencies)
-        return SerializationMixin.from_dict.__func__(cls, value, dependencies=dependencies)
-
-
-class ReferenceConnection(Connection):
-    """Object representing a reference connection."""
-
-    def __init__(
-        self,
-        kind: Literal["reference"] = "reference",
-        authenticationMode: str | None = None,
-        usageDescription: str | None = None,
-        name: str | None = None,
-        target: str | None = None,
-    ) -> None:
-        super().__init__(
-            kind=kind,
-            authenticationMode=authenticationMode,
-            usageDescription=usageDescription,
-        )
-        self.name = _try_powerfx_eval(name)
-        self.target = _try_powerfx_eval(target)
-
-
-class RemoteConnection(Connection):
-    """Object representing a remote connection."""
-
-    def __init__(
-        self,
-        kind: Literal["remote"] = "remote",
-        authenticationMode: str | None = None,
-        usageDescription: str | None = None,
-        name: str | None = None,
-        endpoint: str | None = None,
-    ) -> None:
-        super().__init__(
-            kind=kind,
-            authenticationMode=authenticationMode,
-            usageDescription=usageDescription,
-        )
-        self.name = _try_powerfx_eval(name)
-        self.endpoint = _try_powerfx_eval(endpoint)
-
-
-class ApiKeyConnection(Connection):
-    """Object representing an API key connection."""
-
-    def __init__(
-        self,
-        kind: Literal["key"] = "key",
-        authenticationMode: str | None = None,
-        usageDescription: str | None = None,
-        endpoint: str | None = None,
-        apiKey: str | None = None,
-        key: str | None = None,
-    ) -> None:
-        super().__init__(
-            kind=kind,
-            authenticationMode=authenticationMode,
-            usageDescription=usageDescription,
-        )
-        self.endpoint = _try_powerfx_eval(endpoint)
-        # Support both 'apiKey' and 'key' fields, with 'key' taking precedence if both are provided
-        self.apiKey = _try_powerfx_eval(key if key else apiKey, False)
-
-
-class AnonymousConnection(Connection):
-    """Object representing an anonymous connection."""
-
-    def __init__(
-        self,
-        kind: Literal["anonymous"] = "anonymous",
-        authenticationMode: str | None = None,
-        usageDescription: str | None = None,
-        endpoint: str | None = None,
-    ) -> None:
-        super().__init__(
-            kind=kind,
-            authenticationMode=authenticationMode,
-            usageDescription=usageDescription,
-        )
-        self.endpoint = _try_powerfx_eval(endpoint)
-
-
-Connections = Union[
-    ReferenceConnection,
-    RemoteConnection,
-    ApiKeyConnection,
-    AnonymousConnection,
+_PROTECTION_SCOPE_ACTIVITIES_MAP: dict[str, ProtectionScopeActivities] = {
+    "none": ProtectionScopeActivities.NONE,
+    "uploadText": ProtectionScopeActivities.UPLOAD_TEXT,
+    "uploadFile": ProtectionScopeActivities.UPLOAD_FILE,
+    "downloadText": ProtectionScopeActivities.DOWNLOAD_TEXT,
+    "downloadFile": ProtectionScopeActivities.DOWNLOAD_FILE,
+    "unknownFutureValue": ProtectionScopeActivities.UNKNOWN_FUTURE_VALUE,
+}
+_PROTECTION_SCOPE_ACTIVITIES_SERIALIZE_ORDER: list[tuple[str, ProtectionScopeActivities]] = [
+    ("uploadText", ProtectionScopeActivities.UPLOAD_TEXT),
+    ("uploadFile", ProtectionScopeActivities.UPLOAD_FILE),
+    ("downloadText", ProtectionScopeActivities.DOWNLOAD_TEXT),
+    ("downloadFile", ProtectionScopeActivities.DOWNLOAD_FILE),
 ]
 
 
-class ModelOptions(SerializationMixin):
-    """Object representing model options."""
+def _as_object_list(value: object) -> list[object] | None:
+    if not isinstance(value, (list, tuple, set)):
+        return None
+    return list(cast(Iterable[object], value))
+
+
+def _as_str_dict(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+
+    aliases: dict[str, str] = {}
+    for raw_key, raw_value in cast(dict[object, object], value).items():
+        if isinstance(raw_key, str) and isinstance(raw_value, str):
+            aliases[raw_key] = raw_value
+    return aliases
+
+
+def deserialize_flag(
+    value: object, mapping: Mapping[str, FlagT], enum_cls: type[FlagT]
+) -> FlagT | None:  # pragma: no cover
+    """Deserialize arbitrary input into a flag enum instance."""
+    if value is None:
+        return None
+    if isinstance(value, enum_cls):
+        return value
+    if isinstance(value, int):
+        try:
+            return enum_cls(value)
+        except Exception:
+            return None
+
+    flag_value = enum_cls(0)
+    parts: list[str] = []
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return enum_cls(0)
+        parts.extend([p.strip() for p in raw.split(",") if p.strip()])
+    else:
+        iterable_items = _as_object_list(value)
+        if iterable_items is None:
+            return None
+        for item in iterable_items:
+            if isinstance(item, str):
+                parts.extend([p.strip() for p in item.split(",") if p.strip()])
+            elif isinstance(item, enum_cls):
+                flag_value |= item
+            elif isinstance(item, int):
+                try:
+                    flag_value |= enum_cls(item)
+                except Exception:
+                    logger.warning(f"Failed to convert int {item} to {enum_cls.__name__}")
+
+    for part in parts:
+        member = mapping.get(part)
+        if member is not None:
+            flag_value |= member
+
+    if flag_value == enum_cls(0):
+        none_member = mapping.get("none")
+        if none_member is not None:
+            return none_member
+    return flag_value
+
+
+def serialize_flag(
+    flag_value: Flag | int | None, ordered_parts: Sequence[tuple[str, Flag]]
+) -> str | None:  # pragma: no cover
+    """Serialize a flag enum (or int) into a stable, comma-separated string."""
+    if flag_value is None:
+        return None
+    if isinstance(flag_value, int):
+        if flag_value == 0:
+            return "none"
+        int_parts: list[str] = []
+        for name, member in ordered_parts:
+            if flag_value & member.value:
+                int_parts.append(name)
+        return ",".join(int_parts) if int_parts else "none"
+    if not isinstance(flag_value, Flag):
+        return None
+    if flag_value.value == 0:
+        return "none"
+    parts: list[str] = []
+    for name, member in ordered_parts:
+        if flag_value & member:
+            parts.append(name)
+    return ",".join(parts) if parts else "none"
+
+
+class DlpAction(str, Enum):
+    BLOCK_ACCESS = "blockAccess"
+    OTHER = "other"
+
+
+class RestrictionAction(str, Enum):
+    BLOCK = "block"
+    OTHER = "other"
+
+
+class ProtectionScopeState(str, Enum):
+    NOT_MODIFIED = "notModified"
+    MODIFIED = "modified"
+    UNKNOWN_FUTURE_VALUE = "unknownFutureValue"
+
+
+class ExecutionMode(str, Enum):
+    EVALUATE_INLINE = "evaluateInline"
+    EVALUATE_OFFLINE = "evaluateOffline"
+    UNKNOWN_FUTURE_VALUE = "unknownFutureValue"
+
+
+class PolicyPivotProperty(str, Enum):
+    NONE = "none"
+    ACTIVITY = "activity"
+    LOCATION = "location"
+    UNKNOWN_FUTURE_VALUE = "unknownFutureValue"
+
+
+def translate_activity(activity: Activity) -> ProtectionScopeActivities:
+    mapping = {
+        Activity.UNKNOWN: ProtectionScopeActivities.NONE,
+        Activity.UPLOAD_TEXT: ProtectionScopeActivities.UPLOAD_TEXT,
+        Activity.UPLOAD_FILE: ProtectionScopeActivities.UPLOAD_FILE,
+        Activity.DOWNLOAD_TEXT: ProtectionScopeActivities.DOWNLOAD_TEXT,
+        Activity.DOWNLOAD_FILE: ProtectionScopeActivities.DOWNLOAD_FILE,
+    }
+    return mapping.get(activity, ProtectionScopeActivities.UNKNOWN_FUTURE_VALUE)
+
+
+# --------------------------------------------------------------------------------------
+# Simple value models
+# --------------------------------------------------------------------------------------
+
+AliasSerializableT = TypeVar("AliasSerializableT", bound="_AliasSerializable")
+
+
+class _AliasSerializable(SerializationMixin):
+    """Base class adding alias mapping + pydantic-compat helpers.
+
+    Each subclass can define ``_ALIASES`` mapping internal attribute name -> external serialized key.
+    ``to_dict`` will emit external keys; ``from_dict`` (via ``__init__`` preprocessing) accepts either form.
+
+    Provides light-weight compatibility helpers ``model_dump`` / ``model_validate``
+    """
+
+    _ALIASES: ClassVar[dict[str, str]] = {}
+
+    def __init__(self, **kwargs: Any) -> None:
+        # Normalize alias keys -> internal names across the entire class hierarchy
+        # Collect all aliases from parent classes too
+        all_aliases: dict[str, str] = {}
+        for cls in type(self).__mro__:
+            aliases_obj = _as_str_dict(getattr(cls, "_ALIASES", None))
+            for internal, external in aliases_obj.items():
+                if external not in all_aliases:
+                    all_aliases[external] = internal
+
+        # Normalize all aliased keys in kwargs
+        for external, internal in all_aliases.items():
+            if external in kwargs and internal not in kwargs:
+                kwargs[internal] = kwargs.pop(external)
+
+        # Set normalized kwargs as attributes
+        # This will overwrite any None values that child __init__ may have set from default params
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    # ------------------------------------------------------------------
+    # Compatibility helpers
+    # ------------------------------------------------------------------
+    def model_dump(self, *, by_alias: bool = True, exclude_none: bool = True, **_: Any) -> dict[str, Any]:
+        # Use self.to_dict() to get alias translation
+        d = self.to_dict(exclude_none=exclude_none)
+        # If by_alias=False, translate external -> internal (rarely needed; default True)
+        if not by_alias and self._ALIASES:
+            reverse = {v: k for k, v in self._ALIASES.items()}
+            translated: dict[str, Any] = {}
+            for k, v in d.items():
+                translated[reverse.get(k, k)] = v
+            return translated
+        return d
+
+    def model_dump_json(self, *, by_alias: bool = True, exclude_none: bool = True, **kwargs: Any) -> str:
+        import json
+
+        return json.dumps(self.model_dump(by_alias=by_alias, exclude_none=exclude_none, **kwargs))
+
+    @classmethod
+    def model_validate(cls: type[AliasSerializableT], value: MutableMapping[str, Any]) -> AliasSerializableT:
+        return cls(**value)
+
+    # ------------------------------------------------------------------
+    # Override to handle alias emission
+    # ------------------------------------------------------------------
+    def to_dict(self, *, exclude: set[str] | None = None, exclude_none: bool = True) -> dict[str, Any]:
+        base = SerializationMixin.to_dict(self, exclude=exclude, exclude_none=exclude_none)
+
+        # For Graph API models, remove the auto-generated 'type' field if it's in DEFAULT_EXCLUDE
+        if "type" in self.DEFAULT_EXCLUDE:
+            base.pop("type", None)
+
+        # Collect all aliases from class hierarchy
+        all_aliases: dict[str, str] = {}
+        for cls in type(self).__mro__:
+            aliases_obj = _as_str_dict(getattr(cls, "_ALIASES", None))
+            # Parent aliases first (will be overridden by child if same key)
+            for internal, external in aliases_obj.items():
+                if internal not in all_aliases:
+                    all_aliases[internal] = external
+
+        if not all_aliases:
+            return base
+
+        # Translate internal -> external keys (except 'type' reserved)
+        translated: dict[str, Any] = {}
+        for k, v in base.items():
+            if k == "type":
+                translated[k] = v
+                continue
+            external = all_aliases.get(k, k)
+            translated[external] = v
+        return translated
+
+
+class PolicyLocation(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {"data_type": "@odata.type"}
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"type"}  # Exclude auto-generated type field for Graph API
+
+    def __init__(self, data_type: str | None = None, value: str | None = None, **kwargs: Any) -> None:
+        # Extract aliased values from kwargs
+        if "@odata.type" in kwargs:
+            data_type = kwargs["@odata.type"]
+
+        # Call parent without explicit params with aliases
+        super().__init__(**kwargs)
+        self.data_type = data_type
+        self.value = value
+
+
+class ActivityMetadata(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {"activity": "activity"}
+
+    def __init__(self, activity: Activity, **kwargs: Any) -> None:
+        super().__init__(activity=activity, **kwargs)
+        self.activity = activity
+
+
+class OperatingSystemSpecifications(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {
+        "operating_system_platform": "operatingSystemPlatform",
+        "operating_system_version": "operatingSystemVersion",
+    }
 
     def __init__(
         self,
-        frequencyPenalty: float | None = None,
-        maxOutputTokens: int | None = None,
-        presencePenalty: float | None = None,
-        seed: int | None = None,
-        temperature: float | None = None,
-        topK: int | None = None,
-        topP: float | None = None,
-        stopSequences: list[str] | None = None,
-        allowMultipleToolCalls: bool | None = None,
-        additionalProperties: dict[str, Any] | None = None,
+        operating_system_platform: str | None = None,
+        operating_system_version: str | None = None,
         **kwargs: Any,
     ) -> None:
-        self.frequencyPenalty = frequencyPenalty
-        self.maxOutputTokens = maxOutputTokens
-        self.presencePenalty = presencePenalty
-        self.seed = seed
-        self.temperature = temperature
-        self.topK = topK
-        self.topP = topP
-        self.stopSequences = stopSequences or []
-        self.allowMultipleToolCalls = allowMultipleToolCalls
-        # Merge any additional properties from kwargs into additionalProperties
-        self.additionalProperties = additionalProperties or {}
-        self.additionalProperties.update(kwargs)
+        # Extract aliased values from kwargs
+        if "operatingSystemPlatform" in kwargs:
+            operating_system_platform = kwargs["operatingSystemPlatform"]
+        if "operatingSystemVersion" in kwargs:
+            operating_system_version = kwargs["operatingSystemVersion"]
+
+        # Call parent without explicit params with aliases
+        super().__init__(**kwargs)
+        self.operating_system_platform = operating_system_platform
+        self.operating_system_version = operating_system_version
 
 
-class Model(SerializationMixin):
-    """Object representing a model specification."""
-
-    def __init__(
-        self,
-        id: str | None = None,
-        provider: str | None = None,
-        apiType: str | None = None,
-        connection: Connections | None = None,
-        options: ModelOptions | None = None,
-    ) -> None:
-        self.id = _try_powerfx_eval(id)
-        self.provider = _try_powerfx_eval(provider)
-        self.apiType = _try_powerfx_eval(apiType)
-        if not isinstance(connection, Connection) and connection is not None:
-            connection = Connection.from_dict(connection)
-        self.connection = connection
-        if not isinstance(options, ModelOptions) and options is not None:
-            options = ModelOptions.from_dict(options)
-        self.options = options
-
-
-class Format(SerializationMixin):
-    """Object representing template format."""
+class DeviceMetadata(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {
+        "ip_address": "ipAddress",
+        "operating_system_specifications": "operatingSystemSpecifications",
+    }
 
     def __init__(
         self,
-        kind: str | None = None,
-        strict: bool = False,
-        options: dict[str, Any] | None = None,
+        ip_address: str | None = None,
+        operating_system_specifications: OperatingSystemSpecifications | MutableMapping[str, Any] | None = None,
+        **kwargs: Any,
     ) -> None:
-        self.kind = _try_powerfx_eval(kind)
-        self.strict = strict
-        self.options = options or {}
+        # Extract aliased values from kwargs
+        if "ipAddress" in kwargs:
+            ip_address = kwargs["ipAddress"]
+        if "operatingSystemSpecifications" in kwargs:
+            operating_system_specifications = kwargs["operatingSystemSpecifications"]
+
+        # Convert nested objects
+        if isinstance(operating_system_specifications, MutableMapping):
+            operating_system_specifications = OperatingSystemSpecifications(**operating_system_specifications)
+
+        # Call parent without explicit params with aliases
+        super().__init__(**kwargs)
+        self.ip_address = ip_address
+        self.operating_system_specifications = operating_system_specifications
 
 
-class Parser(SerializationMixin):
-    """Object representing template parser."""
-
-    def __init__(
-        self,
-        kind: str | None = None,
-        options: dict[str, Any] | None = None,
-    ) -> None:
-        self.kind = _try_powerfx_eval(kind)
-        self.options = options or {}
+class IntegratedAppMetadata(_AliasSerializable):
+    def __init__(self, name: str | None = None, version: str | None = None, **kwargs: Any) -> None:
+        super().__init__(name=name, version=version, **kwargs)
+        self.name = name
+        self.version = version
 
 
-class Template(SerializationMixin):
-    """Object representing a template configuration."""
-
-    def __init__(
-        self,
-        format: Format | None = None,
-        parser: Parser | None = None,
-    ) -> None:
-        if not isinstance(format, Format) and format is not None:
-            format = Format.from_dict(format)
-        self.format = format
-        if not isinstance(parser, Parser) and parser is not None:
-            parser = Parser.from_dict(parser)
-        self.parser = parser
-
-
-class AgentDefinition(SerializationMixin):
-    """Object representing a prompt specification."""
-
-    def __init__(
-        self,
-        kind: str | None = None,
-        name: str | None = None,
-        displayName: str | None = None,
-        description: str | None = None,
-        metadata: dict[str, Any] | None = None,
-        inputSchema: PropertySchema | None = None,
-        outputSchema: PropertySchema | None = None,
-    ) -> None:
-        self.kind = _try_powerfx_eval(kind)
-        self.name = _try_powerfx_eval(name)
-        self.displayName = _try_powerfx_eval(displayName)
-        self.description = _try_powerfx_eval(description)
-        self.metadata = metadata
-        if not isinstance(inputSchema, PropertySchema) and inputSchema is not None:
-            inputSchema = PropertySchema.from_dict(inputSchema)
-        self.inputSchema = inputSchema
-        if not isinstance(outputSchema, PropertySchema) and outputSchema is not None:
-            outputSchema = PropertySchema.from_dict(outputSchema)
-        self.outputSchema = outputSchema
-
-    @classmethod
-    def from_dict(
-        cls, value: MutableMapping[str, Any], /, *, dependencies: MutableMapping[str, Any] | None = None
-    ) -> AgentDefinition:
-        """Create an AgentDefinition instance from a dictionary, dispatching to the appropriate subclass."""
-        # Only dispatch if we're being called on the base AgentDefinition class
-        if cls is not AgentDefinition:
-            # We're being called on a subclass, use the normal from_dict
-            return SerializationMixin.from_dict.__func__(cls, value, dependencies=dependencies)
-
-        kind = value.get("kind", "")
-        if kind == "Prompt" or kind == "Agent":
-            return PromptAgent.from_dict(value, dependencies=dependencies)
-        # Default to AgentDefinition
-        return SerializationMixin.from_dict.__func__(cls, value, dependencies=dependencies)
-
-
-ToolT = TypeVar("ToolT", bound="Tool")
-
-
-class Tool(SerializationMixin):
-    """Base class for tools."""
+class ProtectedAppMetadata(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {"application_location": "applicationLocation"}
 
     def __init__(
         self,
         name: str | None = None,
-        kind: str | None = None,
-        description: str | None = None,
-        bindings: list[Binding] | dict[str, Any] | None = None,
-    ) -> None:
-        self.name = _try_powerfx_eval(name)
-        self.kind = _try_powerfx_eval(kind)
-        self.description = _try_powerfx_eval(description)
-        converted_bindings: list[Binding] = []
-        if isinstance(bindings, list):
-            for binding in bindings:
-                if not isinstance(binding, Binding):
-                    binding = Binding.from_dict(binding)
-                converted_bindings.append(binding)
-        elif isinstance(bindings, dict):
-            for k, v in bindings.items():
-                temp_binding = {"name": k, "input": v} if isinstance(v, str) else {"name": k, **v}
-                binding = Binding.from_dict(temp_binding)
-                converted_bindings.append(binding)
-        self.bindings = converted_bindings
-
-    @classmethod
-    def from_dict(
-        cls: type[ToolT], value: MutableMapping[str, Any], /, *, dependencies: MutableMapping[str, Any] | None = None
-    ) -> ToolT:
-        """Create a Tool instance from a dictionary, dispatching to the appropriate subclass."""
-        # Only dispatch if we're being called on the base Tool class
-        if cls is not Tool:
-            # We're being called on a subclass, use the normal from_dict
-            return SerializationMixin.from_dict.__func__(cls, value, dependencies=dependencies)
-
-        kind = value.get("kind", "")
-        if kind == "function":
-            return SerializationMixin.from_dict.__func__(FunctionTool, value, dependencies=dependencies)
-        if kind == "custom":
-            return SerializationMixin.from_dict.__func__(CustomTool, value, dependencies=dependencies)
-        if kind == "web_search":
-            return SerializationMixin.from_dict.__func__(WebSearchTool, value, dependencies=dependencies)
-        if kind == "file_search":
-            return SerializationMixin.from_dict.__func__(FileSearchTool, value, dependencies=dependencies)
-        if kind == "mcp":
-            return SerializationMixin.from_dict.__func__(McpTool, value, dependencies=dependencies)
-        if kind == "openapi":
-            return SerializationMixin.from_dict.__func__(OpenApiTool, value, dependencies=dependencies)
-        if kind == "code_interpreter":
-            return SerializationMixin.from_dict.__func__(CodeInterpreterTool, value, dependencies=dependencies)
-        # Default to base Tool class
-        return SerializationMixin.from_dict.__func__(cls, value, dependencies=dependencies)
-
-
-class FunctionTool(Tool):
-    """Object representing a function tool."""
-
-    def __init__(
-        self,
-        name: str | None = None,
-        kind: str = "function",
-        description: str | None = None,
-        bindings: list[Binding] | None = None,
-        parameters: PropertySchema | list[Property] | dict[str, Any] | None = None,
-        strict: bool = False,
-    ) -> None:
-        super().__init__(
-            name=name,
-            kind=kind,
-            description=description,
-            bindings=bindings,
-        )
-        if isinstance(parameters, list):
-            # If parameters is a list, wrap it in a PropertySchema
-            parameters = PropertySchema(properties=parameters)
-        elif not isinstance(parameters, PropertySchema) and parameters is not None:
-            parameters = PropertySchema.from_dict(parameters)
-        self.parameters = parameters
-        self.strict = strict
-
-
-class CustomTool(Tool):
-    """Object representing a custom tool."""
-
-    def __init__(
-        self,
-        name: str | None = None,
-        kind: str = "custom",
-        description: str | None = None,
-        bindings: list[Binding] | None = None,
-        connection: Connection | None = None,
-        options: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(
-            name=name,
-            kind=kind,
-            description=description,
-            bindings=bindings,
-        )
-        if not isinstance(connection, Connection) and connection is not None:
-            connection = Connection.from_dict(connection)
-        self.connection = connection
-        self.options = options or {}
-
-
-class WebSearchTool(Tool):
-    """Object representing a web search tool."""
-
-    def __init__(
-        self,
-        name: str | None = None,
-        kind: str = "web_search",
-        description: str | None = None,
-        bindings: list[Binding] | None = None,
-        connection: Connection | None = None,
-        options: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(
-            name=name,
-            kind=kind,
-            description=description,
-            bindings=bindings,
-        )
-        if not isinstance(connection, Connection) and connection is not None:
-            connection = Connection.from_dict(connection)
-        self.connection = connection
-        self.options = options or {}
-
-
-class FileSearchTool(Tool):
-    """Object representing a file search tool."""
-
-    def __init__(
-        self,
-        name: str | None = None,
-        kind: str = "file_search",
-        description: str | None = None,
-        bindings: list[Binding] | None = None,
-        connection: Connection | None = None,
-        vectorStoreIds: list[str] | None = None,
-        maximumResultCount: int | None = None,
-        ranker: str | None = None,
-        scoreThreshold: float | None = None,
-        filters: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(
-            name=name,
-            kind=kind,
-            description=description,
-            bindings=bindings,
-        )
-        if not isinstance(connection, Connection) and connection is not None:
-            connection = Connection.from_dict(connection)
-        self.connection = connection
-        self.vectorStoreIds = vectorStoreIds or []
-        self.maximumResultCount = maximumResultCount
-        self.ranker = _try_powerfx_eval(ranker)
-        self.scoreThreshold = scoreThreshold
-        self.filters = filters or {}
-
-
-class McpServerApprovalMode(SerializationMixin):
-    """Base class for MCP server approval modes."""
-
-    def __init__(
-        self,
-        kind: str | None = None,
-    ) -> None:
-        self.kind = _try_powerfx_eval(kind)
-
-
-class McpServerToolAlwaysRequireApprovalMode(McpServerApprovalMode):
-    """MCP server tool always require approval mode."""
-
-    def __init__(
-        self,
-        kind: str = "always",
-    ) -> None:
-        super().__init__(kind=kind)
-
-
-class McpServerToolNeverRequireApprovalMode(McpServerApprovalMode):
-    """MCP server tool never require approval mode."""
-
-    def __init__(
-        self,
-        kind: str = "never",
-    ) -> None:
-        super().__init__(kind=kind)
-
-
-class McpServerToolSpecifyApprovalMode(McpServerApprovalMode):
-    """MCP server tool specify approval mode."""
-
-    def __init__(
-        self,
-        kind: str = "specify",
-        alwaysRequireApprovalTools: list[str] | None = None,
-        neverRequireApprovalTools: list[str] | None = None,
-    ) -> None:
-        super().__init__(kind=kind)
-        self.alwaysRequireApprovalTools = alwaysRequireApprovalTools
-        self.neverRequireApprovalTools = neverRequireApprovalTools
-
-
-class McpTool(Tool):
-    """Object representing an MCP tool."""
-
-    def __init__(
-        self,
-        name: str | None = None,
-        kind: str = "mcp",
-        description: str | None = None,
-        bindings: list[Binding] | None = None,
-        connection: Connection | None = None,
-        serverName: str | None = None,
-        serverDescription: str | None = None,
-        approvalMode: McpServerApprovalMode | None = None,
-        allowedTools: list[str] | None = None,
-        url: str | None = None,
-    ) -> None:
-        super().__init__(
-            name=name,
-            kind=kind,
-            description=description,
-            bindings=bindings,
-        )
-        if not isinstance(connection, Connection) and connection is not None:
-            connection = Connection.from_dict(connection)
-        self.connection = connection
-        self.serverName = _try_powerfx_eval(serverName)
-        self.serverDescription = _try_powerfx_eval(serverDescription)
-        if not isinstance(approvalMode, McpServerApprovalMode) and approvalMode is not None:
-            # Handle simplified string format: "always" -> {"kind": "always"}
-            if isinstance(approvalMode, str):
-                approvalMode = McpServerApprovalMode.from_dict({"kind": approvalMode})
-            else:
-                approvalMode = McpServerApprovalMode.from_dict(approvalMode)
-        self.approvalMode = approvalMode
-        self.allowedTools = allowedTools or []
-        self.url = _try_powerfx_eval(url)
-
-
-class OpenApiTool(Tool):
-    """Object representing an OpenAPI tool."""
-
-    def __init__(
-        self,
-        name: str | None = None,
-        kind: str = "openapi",
-        description: str | None = None,
-        bindings: list[Binding] | None = None,
-        connection: Connection | None = None,
-        specification: str | None = None,
-    ) -> None:
-        super().__init__(
-            name=name,
-            kind=kind,
-            description=description,
-            bindings=bindings,
-        )
-        if not isinstance(connection, Connection) and connection is not None:
-            connection = Connection.from_dict(connection)
-        self.connection = connection
-        self.specification = _try_powerfx_eval(specification)
-
-
-class CodeInterpreterTool(Tool):
-    """Object representing a code interpreter tool."""
-
-    def __init__(
-        self,
-        name: str | None = None,
-        kind: str = "code_interpreter",
-        description: str | None = None,
-        bindings: list[Binding] | None = None,
-        fileIds: list[str] | None = None,
-    ) -> None:
-        super().__init__(
-            name=name,
-            kind=kind,
-            description=description,
-            bindings=bindings,
-        )
-        self.fileIds = fileIds or []
-
-
-class PromptAgent(AgentDefinition):
-    """Object representing a prompt agent specification."""
-
-    def __init__(
-        self,
-        kind: str = "Prompt",
-        name: str | None = None,
-        displayName: str | None = None,
-        description: str | None = None,
-        metadata: dict[str, Any] | None = None,
-        inputSchema: PropertySchema | None = None,
-        outputSchema: PropertySchema | None = None,
-        model: Model | dict[str, Any] | None = None,
-        tools: list[Tool] | None = None,
-        template: Template | dict[str, Any] | None = None,
-        instructions: str | None = None,
-        additionalInstructions: str | None = None,
-    ) -> None:
-        super().__init__(
-            kind=kind,
-            name=name,
-            displayName=displayName,
-            description=description,
-            metadata=metadata,
-            inputSchema=inputSchema,
-            outputSchema=outputSchema,
-        )
-        if not isinstance(model, Model) and model is not None:
-            model = Model.from_dict(model)
-        self.model = model
-        converted_tools: list[Tool] = []
-        for tool in tools or []:
-            if not isinstance(tool, Tool):
-                tool = Tool.from_dict(tool)
-            converted_tools.append(tool)
-        self.tools = converted_tools
-        if not isinstance(template, Template) and template is not None:
-            template = Template.from_dict(template)
-        self.template = template
-        self.instructions = _try_powerfx_eval(instructions)
-        self.additionalInstructions = _try_powerfx_eval(additionalInstructions)
-
-
-class Resource(SerializationMixin):
-    """Object representing a resource."""
-
-    def __init__(
-        self,
-        name: str | None = None,
-        kind: str | None = None,
-    ) -> None:
-        self.name = _try_powerfx_eval(name)
-        self.kind = _try_powerfx_eval(kind)
-
-    @classmethod
-    def from_dict(
-        cls, value: MutableMapping[str, Any], /, *, dependencies: MutableMapping[str, Any] | None = None
-    ) -> Resource:
-        """Create a Resource instance from a dictionary, dispatching to the appropriate subclass."""
-        # Only dispatch if we're being called on the base Resource class
-        if cls is not Resource:
-            # We're being called on a subclass, use the normal from_dict
-            return SerializationMixin.from_dict.__func__(cls, value, dependencies=dependencies)
-
-        kind = value.get("kind", "")
-        if kind == "model":
-            return SerializationMixin.from_dict.__func__(ModelResource, value, dependencies=dependencies)
-        if kind == "tool":
-            return SerializationMixin.from_dict.__func__(ToolResource, value, dependencies=dependencies)
-        return SerializationMixin.from_dict.__func__(cls, value, dependencies=dependencies)
-
-
-class ModelResource(Resource):
-    """Object representing a model resource."""
-
-    def __init__(
-        self,
-        kind: str = "model",
-        name: str | None = None,
-        id: str | None = None,
-    ) -> None:
-        super().__init__(kind=kind, name=name)
-        self.id = _try_powerfx_eval(id)
-
-
-class ToolResource(Resource):
-    """Object representing a tool resource."""
-
-    def __init__(
-        self,
-        kind: str = "tool",
-        name: str | None = None,
-        id: str | None = None,
-        options: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(kind=kind, name=name)
-        self.id = _try_powerfx_eval(id)
-        self.options = options or {}
-
-
-class ProtocolVersionRecord(SerializationMixin):
-    """Object representing a protocol version record."""
-
-    def __init__(
-        self,
-        protocol: str | None = None,
         version: str | None = None,
+        application_location: PolicyLocation | MutableMapping[str, Any] | None = None,
+        **kwargs: Any,
     ) -> None:
-        self.protocol = _try_powerfx_eval(protocol)
-        self.version = _try_powerfx_eval(version)
+        # Extract aliased values from kwargs
+        if "applicationLocation" in kwargs:
+            application_location = kwargs["applicationLocation"]
+
+        # Convert nested objects
+        if isinstance(application_location, MutableMapping):
+            application_location = PolicyLocation(**application_location)
+
+        # Call parent without explicit params with aliases
+        super().__init__(**kwargs)
+        self.name = name
+        self.version = version
+        self.application_location = application_location
 
 
-class EnvironmentVariable(SerializationMixin):
-    """Object representing an environment variable."""
+class DlpActionInfo(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {"restriction_action": "restrictionAction"}
 
     def __init__(
         self,
-        name: str | None = None,
-        value: str | None = None,
+        action: DlpAction | None = None,
+        restriction_action: RestrictionAction | None = None,
+        **kwargs: Any,
     ) -> None:
-        self.name = _try_powerfx_eval(name)
-        self.value = _try_powerfx_eval(value)
+        # Extract aliased values from kwargs
+        if "restrictionAction" in kwargs:
+            restriction_action = kwargs["restrictionAction"]
+
+        # Call parent without explicit params with aliases
+        super().__init__(**kwargs)
+        self.action = action
+        self.restriction_action = restriction_action
 
 
-class AgentManifest(SerializationMixin):
-    """Object representing an agent manifest."""
+class AccessedResourceDetails(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {
+        "label_id": "labelId",
+        "access_type": "accessType",
+        "is_cross_prompt_injection_detected": "isCrossPromptInjectionDetected",
+    }
 
     def __init__(
         self,
+        identifier: str | None = None,
         name: str | None = None,
-        displayName: str | None = None,
-        description: str | None = None,
-        metadata: dict[str, Any] | None = None,
-        template: AgentDefinition | None = None,
-        parameters: PropertySchema | None = None,
-        resources: list[Resource] | dict[str, Any] | None = None,
+        url: str | None = None,
+        label_id: str | None = None,
+        access_type: str | None = None,
+        status: str | None = None,
+        is_cross_prompt_injection_detected: bool | None = None,
+        **kwargs: Any,
     ) -> None:
-        self.name = _try_powerfx_eval(name)
-        self.displayName = _try_powerfx_eval(displayName)
-        self.description = _try_powerfx_eval(description)
-        self.metadata = metadata or {}
-        if not isinstance(template, AgentDefinition) and template is not None:
-            template = AgentDefinition.from_dict(template)
-        self.template = template or AgentDefinition()
-        if not isinstance(parameters, PropertySchema) and parameters is not None:
-            parameters = PropertySchema.from_dict(parameters)
-        self.parameters = parameters or PropertySchema()
-        converted_resources: list[Resource] = []
-        if isinstance(resources, list):
-            for resource in resources:
-                if not isinstance(resource, Resource):
-                    resource = Resource.from_dict(resource)
-                converted_resources.append(resource)
-        elif isinstance(resources, dict):
-            for k, v in resources.items():
-                temp_resource = {"name": k, **v}
-                resource = Resource.from_dict(temp_resource)
-                converted_resources.append(resource)
-        self.resources = converted_resources
+        # Extract aliased values from kwargs
+        if "labelId" in kwargs:
+            label_id = kwargs["labelId"]
+        if "accessType" in kwargs:
+            access_type = kwargs["accessType"]
+        if "isCrossPromptInjectionDetected" in kwargs:
+            is_cross_prompt_injection_detected = kwargs["isCrossPromptInjectionDetected"]
+
+        # Call parent without explicit params with aliases
+        super().__init__(**kwargs)
+        self.identifier = identifier
+        self.name = name
+        self.url = url
+        self.label_id = label_id
+        self.access_type = access_type
+        self.status = status
+        self.is_cross_prompt_injection_detected = is_cross_prompt_injection_detected
 
 
-AgentSchemaSpec = Union[
-    AgentManifest,
-    AgentDefinition,
-    PromptAgent,
-    Tool,
-    FunctionTool,
-    CustomTool,
-    WebSearchTool,
-    FileSearchTool,
-    McpTool,
-    OpenApiTool,
-    CodeInterpreterTool,
-    Resource,
-    ModelResource,
-    ToolResource,
-    Connection,
-    ReferenceConnection,
-    RemoteConnection,
-    ApiKeyConnection,
-    AnonymousConnection,
-    Property,
-    ArrayProperty,
-    ObjectProperty,
-    PropertySchema,
-    McpServerApprovalMode,
-    McpServerToolAlwaysRequireApprovalMode,
-    McpServerToolNeverRequireApprovalMode,
-    McpServerToolSpecifyApprovalMode,
-    Binding,
-    Format,
-    Parser,
-    Template,
-    Model,
-    ModelOptions,
-    ProtocolVersionRecord,
-    EnvironmentVariable,
+class AiInteractionPlugin(_AliasSerializable):
+    def __init__(
+        self,
+        identifier: str | None = None,
+        name: str | None = None,
+        version: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(identifier=identifier, name=name, version=version, **kwargs)
+        self.identifier = identifier
+        self.name = name
+        self.version = version
+
+
+class AiAgentInfo(_AliasSerializable):
+    def __init__(
+        self,
+        identifier: str | None = None,
+        name: str | None = None,
+        version: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(identifier=identifier, name=name, version=version, **kwargs)
+        self.identifier = identifier
+        self.name = name
+        self.version = version
+
+
+# --------------------------------------------------------------------------------------
+# Content models
+# --------------------------------------------------------------------------------------
+
+
+class GraphDataTypeBase(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {"data_type": "@odata.type"}
+    # Exclude the auto-generated 'type' field - Graph API uses @odata.type instead
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"type"}
+
+    def __init__(self, data_type: str, **kwargs: Any) -> None:
+        super().__init__(data_type=data_type, **kwargs)
+        self.data_type = data_type
+
+
+class ContentBase(GraphDataTypeBase):
+    pass
+
+
+class PurviewTextContent(ContentBase):
+    def __init__(self, data: str, data_type: str = "microsoft.graph.textContent", **kwargs: Any) -> None:
+        super().__init__(data_type=data_type, **kwargs)
+        self.data = data
+
+
+class PurviewBinaryContent(ContentBase):
+    def __init__(self, data: bytes, data_type: str = "microsoft.graph.binaryContent", **kwargs: Any) -> None:
+        super().__init__(data_type=data_type, **kwargs)
+        self.data = data
+
+    def to_dict(self, *, exclude: set[str] | None = None, exclude_none: bool = True) -> dict[str, Any]:
+        import base64
+
+        base = super().to_dict(exclude=exclude, exclude_none=exclude_none)
+        # Ensure bytes encoded as base64 string like pydantic
+        data_bytes = getattr(self, "data", b"") or b""
+        base["data"] = base64.b64encode(data_bytes).decode("utf-8")
+        return base
+
+
+class ProcessConversationMetadata(GraphDataTypeBase):
+    _ALIASES: ClassVar[dict[str, str]] = {
+        "correlation_id": "correlationId",
+        "sequence_number": "sequenceNumber",
+        "is_truncated": "isTruncated",
+        "created_date_time": "createdDateTime",
+        "modified_date_time": "modifiedDateTime",
+        "parent_message_id": "parentMessageId",
+        "accessed_resources": "accessedResources_v2",
+    }
+
+    def __init__(
+        self,
+        identifier: str | None = None,
+        content: PurviewTextContent | PurviewBinaryContent | ContentBase | MutableMapping[str, Any] | None = None,
+        name: str | None = None,
+        is_truncated: bool | None = None,
+        data_type: str = "microsoft.graph.processConversationMetadata",  # emitted via base
+        correlation_id: str | None = None,
+        sequence_number: int | None = None,
+        length: int | None = None,
+        created_date_time: datetime | None = None,
+        modified_date_time: datetime | None = None,
+        parent_message_id: str | None = None,
+        accessed_resources: list[AccessedResourceDetails | MutableMapping[str, Any]] | None = None,
+        plugins: list[AiInteractionPlugin | MutableMapping[str, Any]] | None = None,
+        agents: list[AiAgentInfo | MutableMapping[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # Extract aliased values from kwargs
+        if "correlationId" in kwargs:
+            correlation_id = kwargs["correlationId"]
+        if "sequenceNumber" in kwargs:
+            sequence_number = kwargs["sequenceNumber"]
+        if "isTruncated" in kwargs:
+            is_truncated = kwargs["isTruncated"]
+        if "createdDateTime" in kwargs:
+            created_date_time = kwargs["createdDateTime"]
+        if "modifiedDateTime" in kwargs:
+            modified_date_time = kwargs["modifiedDateTime"]
+        if "parentMessageId" in kwargs:
+            parent_message_id = kwargs["parentMessageId"]
+        if "accessedResources_v2" in kwargs:
+            accessed_resources = kwargs["accessedResources_v2"]
+
+        # Convert nested objects
+        if isinstance(content, MutableMapping):
+            # determine by type? fall back to text content
+            c_type = content.get("@odata.type") or content.get("data_type")
+            if c_type and "binary" in str(c_type):
+                content = PurviewBinaryContent(**content)
+            else:
+                content = PurviewTextContent(**content)
+        accessed_list: list[AccessedResourceDetails] | None = None
+        if accessed_resources:
+            accessed_list = [
+                ar if isinstance(ar, AccessedResourceDetails) else AccessedResourceDetails(**ar)
+                for ar in accessed_resources
+            ]
+        plugin_list: list[AiInteractionPlugin] | None = None
+        if plugins:
+            plugin_list = [p if isinstance(p, AiInteractionPlugin) else AiInteractionPlugin(**p) for p in plugins]
+        agent_list: list[AiAgentInfo] | None = None
+        if agents:
+            agent_list = [a if isinstance(a, AiAgentInfo) else AiAgentInfo(**a) for a in agents]
+
+        # Call parent without explicit params with aliases
+        super().__init__(data_type=data_type, **kwargs)
+        self.identifier = identifier
+        self.content = content
+        self.name = name
+        self.correlation_id = correlation_id
+        self.sequence_number = sequence_number
+        self.length = length
+        self.is_truncated = is_truncated
+        self.created_date_time = created_date_time
+        self.modified_date_time = modified_date_time
+        self.parent_message_id = parent_message_id
+        self.accessed_resources = accessed_list
+        self.plugins = plugin_list
+        self.agents = agent_list
+
+
+class ContentToProcess(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {
+        "content_entries": "contentEntries",
+        "activity_metadata": "activityMetadata",
+        "device_metadata": "deviceMetadata",
+        "integrated_app_metadata": "integratedAppMetadata",
+        "protected_app_metadata": "protectedAppMetadata",
+    }
+
+    def __init__(
+        self,
+        content_entries: list[ProcessConversationMetadata | MutableMapping[str, Any]],
+        activity_metadata: ActivityMetadata | MutableMapping[str, Any],
+        device_metadata: DeviceMetadata | MutableMapping[str, Any],
+        integrated_app_metadata: IntegratedAppMetadata | MutableMapping[str, Any],
+        protected_app_metadata: ProtectedAppMetadata | MutableMapping[str, Any],
+        **kwargs: Any,
+    ) -> None:
+        # Extract aliased values from kwargs
+        if "contentEntries" in kwargs:
+            content_entries = kwargs["contentEntries"]
+        if "activityMetadata" in kwargs:
+            activity_metadata = kwargs["activityMetadata"]
+        if "deviceMetadata" in kwargs:
+            device_metadata = kwargs["deviceMetadata"]
+        if "integratedAppMetadata" in kwargs:
+            integrated_app_metadata = kwargs["integratedAppMetadata"]
+        if "protectedAppMetadata" in kwargs:
+            protected_app_metadata = kwargs["protectedAppMetadata"]
+
+        # Convert nested objects
+        entries = [
+            e if isinstance(e, ProcessConversationMetadata) else ProcessConversationMetadata(**e)
+            for e in content_entries
+        ]
+        if isinstance(activity_metadata, MutableMapping):
+            activity_metadata = ActivityMetadata(**activity_metadata)
+        if isinstance(device_metadata, MutableMapping):
+            device_metadata = DeviceMetadata(**device_metadata)
+        if isinstance(integrated_app_metadata, MutableMapping):
+            integrated_app_metadata = IntegratedAppMetadata(**integrated_app_metadata)
+        if isinstance(protected_app_metadata, MutableMapping):
+            protected_app_metadata = ProtectedAppMetadata(**protected_app_metadata)
+
+        # Call parent without explicit params with aliases
+        super().__init__(**kwargs)
+        self.content_entries = entries
+        self.activity_metadata = activity_metadata
+        self.device_metadata = device_metadata
+        self.integrated_app_metadata = integrated_app_metadata
+        self.protected_app_metadata = protected_app_metadata
+
+
+# --------------------------------------------------------------------------------------
+# Request models
+# --------------------------------------------------------------------------------------
+
+
+class ProcessContentRequest(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {"content_to_process": "contentToProcess"}
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {
+        "correlation_id",
+    }
+
+    def __init__(
+        self,
+        content_to_process: ContentToProcess | MutableMapping[str, Any],
+        user_id: str,
+        tenant_id: str,
+        correlation_id: str | None = None,
+        process_inline: bool | None = None,
+        scope_identifier: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # Extract aliased values from kwargs
+        if "contentToProcess" in kwargs:
+            content_to_process = kwargs["contentToProcess"]
+
+        # Convert nested objects
+        if isinstance(content_to_process, MutableMapping):
+            content_to_process = ContentToProcess(**content_to_process)
+
+        # Call parent without explicit params with aliases
+        super().__init__(**kwargs)
+        self.content_to_process = content_to_process
+        self.user_id = user_id
+        self.tenant_id = tenant_id
+        self.correlation_id = correlation_id
+        self.process_inline = process_inline
+        self.scope_identifier = scope_identifier
+
+
+class ProtectionScopesRequest(_AliasSerializable):
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"correlation_id"}
+    _ALIASES: ClassVar[dict[str, str]] = {
+        "pivot_on": "pivotOn",
+        "device_metadata": "deviceMetadata",
+        "integrated_app_metadata": "integratedAppMetadata",
+    }
+
+    def __init__(
+        self,
+        user_id: str,
+        tenant_id: str,
+        activities: ProtectionScopeActivities | str | int | Sequence[str] | None = None,
+        locations: list[PolicyLocation | MutableMapping[str, Any]] | None = None,
+        pivot_on: PolicyPivotProperty | None = None,
+        device_metadata: DeviceMetadata | MutableMapping[str, Any] | None = None,
+        integrated_app_metadata: IntegratedAppMetadata | MutableMapping[str, Any] | None = None,
+        correlation_id: str | None = None,
+        scope_identifier: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # Extract aliased values from kwargs
+        if "pivotOn" in kwargs:
+            pivot_on = kwargs["pivotOn"]
+        if "deviceMetadata" in kwargs:
+            device_metadata = kwargs["deviceMetadata"]
+        if "integratedAppMetadata" in kwargs:
+            integrated_app_metadata = kwargs["integratedAppMetadata"]
+
+        # Deserialize activities flag
+        if not isinstance(activities, ProtectionScopeActivities) and activities is not None:
+            activities = deserialize_flag(activities, _PROTECTION_SCOPE_ACTIVITIES_MAP, ProtectionScopeActivities)
+
+        # Convert nested objects
+        if locations:
+            locations = [loc if isinstance(loc, PolicyLocation) else PolicyLocation(**loc) for loc in locations]
+        if isinstance(device_metadata, MutableMapping):
+            device_metadata = DeviceMetadata(**device_metadata)
+        if isinstance(integrated_app_metadata, MutableMapping):
+            integrated_app_metadata = IntegratedAppMetadata(**integrated_app_metadata)
+
+        # Call parent without explicit params with aliases
+        super().__init__(**kwargs)
+        self.user_id = user_id
+        self.tenant_id = tenant_id
+        self.activities = activities
+        self.locations = locations
+        self.pivot_on = pivot_on
+        self.device_metadata = device_metadata
+        self.integrated_app_metadata = integrated_app_metadata
+        self.correlation_id = correlation_id
+        self.scope_identifier = scope_identifier
+
+    def to_dict(self, *, exclude: set[str] | None = None, exclude_none: bool = True) -> dict[str, Any]:
+        # Get base dict (activities will be missing because Flag isn't JSON-serializable)
+        base = super().to_dict(exclude=exclude, exclude_none=exclude_none)
+
+        # Manually serialize activities flag if present and not excluded
+        if self.activities is not None or not exclude_none:
+            if self.activities is not None:
+                base["activities"] = serialize_flag(self.activities, _PROTECTION_SCOPE_ACTIVITIES_SERIALIZE_ORDER)
+            elif not exclude_none:
+                base["activities"] = None
+
+        return base
+
+
+class ContentActivitiesRequest(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {
+        "user_id": "userId",
+        "scope_identifier": "scopeIdentifier",
+        "content_to_process": "contentMetadata",
+    }
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"correlation_id"}
+
+    def __init__(
+        self,
+        user_id: str,
+        content_to_process: ContentToProcess | MutableMapping[str, Any],
+        tenant_id: str,
+        id: str | None = None,
+        scope_identifier: str | None = None,
+        correlation_id: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # Extract aliased values from kwargs
+        if "userId" in kwargs:
+            user_id = kwargs["userId"]
+        if "scopeIdentifier" in kwargs:
+            scope_identifier = kwargs["scopeIdentifier"]
+        if "contentMetadata" in kwargs:
+            content_to_process = kwargs["contentMetadata"]
+
+        # Convert nested objects
+        if isinstance(content_to_process, MutableMapping):
+            content_to_process = ContentToProcess(**content_to_process)
+
+        # Call parent without explicit params with aliases
+        super().__init__(**kwargs)
+        self.id = id or str(uuid4())
+        self.user_id = user_id
+        self.content_to_process = content_to_process
+        self.tenant_id = tenant_id
+        self.scope_identifier = scope_identifier
+        self.correlation_id = correlation_id
+
+
+# --------------------------------------------------------------------------------------
+# Response models
+# --------------------------------------------------------------------------------------
+
+
+class ErrorDetails(_AliasSerializable):
+    def __init__(self, code: str | None = None, message: str | None = None, **kwargs: Any) -> None:
+        super().__init__(code=code, message=message, **kwargs)
+        self.code = code
+        self.message = message
+
+
+class ProcessingError(_AliasSerializable):
+    def __init__(self, message: str | None = None, **kwargs: Any) -> None:
+        super().__init__(message=message, **kwargs)
+        self.message = message
+
+
+class ProcessContentResponse(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {
+        "protection_scope_state": "protectionScopeState",
+        "policy_actions": "policyActions",
+        "processing_errors": "processingErrors",
+        "correlation_id": "correlationId",
+    }
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"correlation_id"}
+
+    id: str | None
+    protection_scope_state: ProtectionScopeState | None
+    policy_actions: list[DlpActionInfo] | None
+    processing_errors: list[ProcessingError] | None
+    correlation_id: str | None
+
+    def __init__(
+        self,
+        id: str | None = None,
+        protection_scope_state: ProtectionScopeState | None = None,
+        policy_actions: list[DlpActionInfo | MutableMapping[str, Any]] | None = None,
+        processing_errors: list[ProcessingError | MutableMapping[str, Any]] | None = None,
+        correlation_id: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # Extract aliased values from kwargs
+        if "protectionScopeState" in kwargs:
+            protection_scope_state = kwargs["protectionScopeState"]
+        if "policyActions" in kwargs:
+            policy_actions = kwargs["policyActions"]
+        if "processingErrors" in kwargs:
+            processing_errors = kwargs["processingErrors"]
+        if "correlationId" in kwargs:
+            correlation_id = kwargs["correlationId"]
+
+        # Convert to objects
+        converted_policy_actions: list[DlpActionInfo] | None = None
+        if policy_actions is not None:
+            converted_policy_actions = [
+                p if isinstance(p, DlpActionInfo) else DlpActionInfo(**p) for p in policy_actions
+            ]
+
+        converted_processing_errors: list[ProcessingError] | None = None
+        if processing_errors is not None:
+            converted_processing_errors = [
+                pe if isinstance(pe, ProcessingError) else ProcessingError(**pe) for pe in processing_errors
+            ]
+
+        super().__init__(**kwargs)
+        self.id = id
+        self.protection_scope_state = protection_scope_state
+        self.policy_actions = converted_policy_actions
+        self.processing_errors = converted_processing_errors
+        self.correlation_id = correlation_id
+
+
+class PolicyScope(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {"policy_actions": "policyActions", "execution_mode": "executionMode"}
+
+    activities: ProtectionScopeActivities | None
+    locations: list[PolicyLocation] | None
+    policy_actions: list[DlpActionInfo] | None
+    execution_mode: ExecutionMode | None
+
+    def __init__(
+        self,
+        activities: ProtectionScopeActivities | str | int | Sequence[str] | None = None,
+        locations: list[PolicyLocation | MutableMapping[str, Any]] | None = None,
+        policy_actions: list[DlpActionInfo | MutableMapping[str, Any]] | None = None,
+        execution_mode: ExecutionMode | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # Extract aliased values from kwargs
+        if "policyActions" in kwargs:
+            policy_actions = kwargs["policyActions"]
+        if "executionMode" in kwargs:
+            execution_mode = kwargs["executionMode"]
+
+        # Deserialize activities flag
+        if not isinstance(activities, ProtectionScopeActivities) and activities is not None:
+            activities = deserialize_flag(activities, _PROTECTION_SCOPE_ACTIVITIES_MAP, ProtectionScopeActivities)
+
+        # Convert nested objects
+        converted_locations: list[PolicyLocation] | None = None
+        if locations is not None:
+            converted_locations = [
+                loc if isinstance(loc, PolicyLocation) else PolicyLocation(**loc) for loc in locations
+            ]
+
+        converted_policy_actions: list[DlpActionInfo] | None = None
+        if policy_actions is not None:
+            converted_policy_actions = [
+                p if isinstance(p, DlpActionInfo) else DlpActionInfo(**p) for p in policy_actions
+            ]
+
+        # Call parent without explicit params with aliases
+        super().__init__(**kwargs)
+        self.activities = activities
+        self.locations = converted_locations
+        self.policy_actions = converted_policy_actions
+        self.execution_mode = execution_mode
+
+    def to_dict(self, *, exclude: set[str] | None = None, exclude_none: bool = True) -> dict[str, Any]:
+        # Get base dict (activities will be missing because Flag isn't JSON-serializable)
+        base = super().to_dict(exclude=exclude, exclude_none=exclude_none)
+
+        # Manually serialize activities flag if present and not excluded
+        if self.activities is not None or not exclude_none:
+            if self.activities is not None:
+                base["activities"] = serialize_flag(self.activities, _PROTECTION_SCOPE_ACTIVITIES_SERIALIZE_ORDER)
+            elif not exclude_none:
+                base["activities"] = None
+
+        return base
+
+
+class ProtectionScopesResponse(_AliasSerializable):
+    _ALIASES: ClassVar[dict[str, str]] = {
+        "scope_identifier": "scopeIdentifier",
+        "scopes": "value",
+        "correlation_id": "correlationId",
+    }
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"correlation_id"}
+
+    scope_identifier: str | None
+    scopes: list[PolicyScope] | None
+    correlation_id: str | None
+
+    def __init__(
+        self,
+        scope_identifier: str | None = None,
+        scopes: list[PolicyScope | MutableMapping[str, Any]] | None = None,
+        correlation_id: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # Extract aliased values from kwargs before they're normalized by parent
+        if "scopeIdentifier" in kwargs:
+            scope_identifier = kwargs["scopeIdentifier"]
+        if "value" in kwargs:
+            scopes = kwargs["value"]
+        if "correlationId" in kwargs:
+            correlation_id = kwargs["correlationId"]
+
+        converted_scopes: list[PolicyScope] | None = None
+        if scopes is not None:
+            converted_scopes = [s if isinstance(s, PolicyScope) else PolicyScope(**s) for s in scopes]
+
+        # Don't pass parameters that have aliases - let parent normalize them
+        super().__init__(**kwargs)
+        self.scope_identifier = scope_identifier
+        self.scopes = converted_scopes
+        self.correlation_id = correlation_id
+
+
+class ContentActivitiesResponse(_AliasSerializable):
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"correlation_id"}
+    _ALIASES: ClassVar[dict[str, str]] = {"correlation_id": "correlationId"}
+
+    status_code: int | None
+    error: ErrorDetails | None
+    correlation_id: str | None
+
+    def __init__(
+        self,
+        status_code: int | None = None,
+        error: ErrorDetails | MutableMapping[str, Any] | None = None,
+        correlation_id: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if "correlationId" in kwargs:
+            correlation_id = kwargs["correlationId"]
+        if isinstance(error, MutableMapping):
+            error = ErrorDetails(**error)
+        super().__init__(status_code=status_code, error=error, correlation_id=correlation_id, **kwargs)
+        self.status_code = status_code
+        self.error = error
+        self.correlation_id = correlation_id
+
+
+__all__ = [
+    "AccessedResourceDetails",
+    "Activity",
+    "ActivityMetadata",
+    "AiAgentInfo",
+    "AiInteractionPlugin",
+    "ContentActivitiesRequest",
+    "ContentActivitiesResponse",
+    "ContentBase",
+    "ContentToProcess",
+    "DeviceMetadata",
+    "DlpAction",
+    "DlpActionInfo",
+    "ExecutionMode",
+    "GraphDataTypeBase",
+    "IntegratedAppMetadata",
+    "OperatingSystemSpecifications",
+    "PolicyLocation",
+    "PolicyPivotProperty",
+    "PolicyScope",
+    "ProcessContentRequest",
+    "ProcessContentResponse",
+    "ProcessConversationMetadata",
+    "ProcessingError",
+    "ProtectedAppMetadata",
+    "ProtectionScopeActivities",
+    "ProtectionScopeState",
+    "ProtectionScopesRequest",
+    "ProtectionScopesResponse",
+    "PurviewBinaryContent",
+    "PurviewTextContent",
+    "RestrictionAction",
+    "deserialize_flag",
+    "serialize_flag",
+    "translate_activity",
 ]
-
-
-def agent_schema_dispatch(schema: dict[str, Any]) -> AgentSchemaSpec | None:
-    """Create a component instance from a dictionary, dispatching to the appropriate class based on 'kind' field."""
-    kind = schema.get("kind")
-
-    # If no kind field, assume it's an AgentManifest
-    if kind is None:
-        return AgentManifest.from_dict(schema)
-    # Match on the kind field to determine which class to instantiate
-    match kind.lower():
-        # Agent types
-        case "prompt":
-            return PromptAgent.from_dict(schema)
-        case "agent":
-            return AgentDefinition.from_dict(schema)
-
-        # Resource types
-        case "tool":
-            return ToolResource.from_dict(schema)
-        case "model":
-            return ModelResource.from_dict(schema)
-        case "resource":
-            return Resource.from_dict(schema)
-
-        # Tool types
-        case "function":
-            return FunctionTool.from_dict(schema)
-        case "custom":
-            return CustomTool.from_dict(schema)
-        case "web_search":
-            return WebSearchTool.from_dict(schema)
-        case "file_search":
-            return FileSearchTool.from_dict(schema)
-        case "mcp":
-            return McpTool.from_dict(schema)
-        case "openapi":
-            return OpenApiTool.from_dict(schema)
-        case "code_interpreter":
-            return CodeInterpreterTool.from_dict(schema)
-
-        # Connection types
-        case "reference":
-            return ReferenceConnection.from_dict(schema)
-        case "remote":
-            return RemoteConnection.from_dict(schema)
-        case "key":
-            return ApiKeyConnection.from_dict(schema)
-        case "anonymous":
-            return AnonymousConnection.from_dict(schema)
-        case "connection":
-            return Connection.from_dict(schema)
-
-        # Property types
-        case "array":
-            return ArrayProperty.from_dict(schema)
-        case "object":
-            return ObjectProperty.from_dict(schema)
-        case "property":
-            return Property.from_dict(schema)
-
-        # MCP Server Approval Mode types
-        case "always":
-            return McpServerToolAlwaysRequireApprovalMode.from_dict(schema)
-        case "never":
-            return McpServerToolNeverRequireApprovalMode.from_dict(schema)
-        case "specify":
-            return McpServerToolSpecifyApprovalMode.from_dict(schema)
-        case "approval_mode":
-            return McpServerApprovalMode.from_dict(schema)
-
-        # Other component types
-        case "binding":
-            return Binding.from_dict(schema)
-        case "format":
-            return Format.from_dict(schema)
-        case "parser":
-            return Parser.from_dict(schema)
-        case "template":
-            return Template.from_dict(schema)
-        case "model":
-            return Model.from_dict(schema)
-        case "model_options":
-            return ModelOptions.from_dict(schema)
-        case "property_schema":
-            return PropertySchema.from_dict(schema)
-        case "protocol_version":
-            return ProtocolVersionRecord.from_dict(schema)
-        case "environment_variable":
-            return EnvironmentVariable.from_dict(schema)
-
-        # Unknown kind
-        case _:
-            return None

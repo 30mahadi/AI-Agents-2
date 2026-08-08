@@ -1,23 +1,27 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-from __future__ import annotations
-
-import importlib.metadata
-
-from ._execute_code_tool import MontyExecuteCodeTool
-from ._provider import MontyCodeActProvider
-from ._types import FileMount, FileMountInput, MountMode
-
-try:
-    __version__ = importlib.metadata.version(__name__)
-except importlib.metadata.PackageNotFoundError:
-    __version__ = "0.0.0"
+from ._cache import CacheProvider
+from ._exceptions import (
+    PurviewAuthenticationError,
+    PurviewPaymentRequiredError,
+    PurviewRateLimitError,
+    PurviewRequestError,
+    PurviewServiceError,
+)
+from ._middleware import PurviewChatPolicyMiddleware, PurviewPolicyMiddleware
+from ._settings import PurviewAppLocation, PurviewLocationType, PurviewSettings, get_purview_scopes
 
 __all__ = [
-    "FileMount",
-    "FileMountInput",
-    "MontyCodeActProvider",
-    "MontyExecuteCodeTool",
-    "MountMode",
-    "__version__",
+    "CacheProvider",
+    "PurviewAppLocation",
+    "PurviewAuthenticationError",
+    "PurviewChatPolicyMiddleware",
+    "PurviewLocationType",
+    "PurviewPaymentRequiredError",
+    "PurviewPolicyMiddleware",
+    "PurviewRateLimitError",
+    "PurviewRequestError",
+    "PurviewServiceError",
+    "PurviewSettings",
+    "get_purview_scopes",
 ]
