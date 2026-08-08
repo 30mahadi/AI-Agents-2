@@ -1,74 +1,51 @@
-# Get Started with Microsoft Agent Framework Mistral AI
+# DevUI File Search Agent
 
-Please install this package:
+Interactive web UI for uploading and chatting with documents, images, audio, and video using Azure Content Understanding + OpenAI file_search RAG.
 
-```bash
-pip install agent-framework-mistral --pre
-```
+## How It Works
 
-and see the [README](https://github.com/microsoft/agent-framework/tree/main/python/README.md) for more information.
+1. **Upload** any supported file (PDF, image, audio, video) via the DevUI chat
+2. **CU analyzes** the file — auto-selects the right analyzer per media type
+3. **Markdown extracted** by CU is uploaded to an OpenAI vector store
+4. **file_search** tool is registered — LLM retrieves top-k relevant chunks
+5. **Ask questions** across all uploaded documents with token-efficient RAG
 
-See the [Mistral agent sample](../../samples/02-agents/providers/mistral/mistral_agent_basic.py) and the
-[Mistral embedding sample](../../samples/02-agents/providers/mistral/mistral_embeddings.py) for runnable examples.
+## Setup
 
-## Chat Client
+1. Set environment variables (or create a `.env` file in `python/`):
+   ```bash
+   FOUNDRY_PROJECT_ENDPOINT=https://your-project.services.ai.azure.com/
+   AZURE_OPENAI_RESPONSES_DEPLOYMENT_NAME=gpt-4.1
+   AZURE_CONTENTUNDERSTANDING_ENDPOINT=https://your-cu-resource.services.ai.azure.com/
+   ```
 
-The `MistralChatClient` provides chat completions using Mistral AI models, with support for
-streaming, function tools, and structured output.
+2. Log in with Azure CLI:
+   ```bash
+   az login
+   ```
 
-### Quick Start
+3. Run with DevUI:
+   ```bash
+   devui samples/02-agents/devui/agent_content_understanding_file_search_azure_openai
+   ```
 
-```python
-from agent_framework import Agent
-from agent_framework.mistral import MistralChatClient
+4. Open the DevUI URL in your browser and start uploading files.
 
-# Using environment variables (MISTRAL_API_KEY, MISTRAL_CHAT_MODEL)
-# Parameters can also be passed directly:
-# MistralChatClient(model="mistral-large-latest", api_key="your-api-key")
-client = MistralChatClient()
-try:
-    agent = Agent(client=client, instructions="You are a helpful assistant.")
-    response = await agent.run("Hello!")
-    print(response.text)
-finally:
-    await client.close()
-```
+## Supported File Types
 
-### Configuration
+| Type | Formats | CU Analyzer (auto-detected) |
+|------|---------|----------------------------|
+| Documents | PDF, DOCX, XLSX, PPTX, HTML, TXT, Markdown | `prebuilt-documentSearch` |
+| Images | JPEG, PNG, TIFF, BMP | `prebuilt-documentSearch` |
+| Audio | WAV, MP3, FLAC, OGG, M4A | `prebuilt-audioSearch` |
+| Video | MP4, MOV, AVI, WebM | `prebuilt-videoSearch` |
 
-| Environment Variable | Description |
-|---|---|
-| `MISTRAL_API_KEY` | Your Mistral AI API key |
-| `MISTRAL_CHAT_MODEL` | Chat model name (e.g., `mistral-large-latest`) |
-| `MISTRAL_SERVER_URL` | Optional server URL override |
+## Comparison with the multimodal agent
 
-## Embedding Client
-
-The `MistralEmbeddingClient` provides embedding generation using Mistral AI models.
-
-### Quick Start
-
-```python
-from agent_framework.mistral import MistralEmbeddingClient
-
-# Using environment variables (MISTRAL_API_KEY, MISTRAL_EMBEDDING_MODEL)
-client = MistralEmbeddingClient()
-
-try:
-    # Parameters can also be passed directly:
-    # MistralEmbeddingClient(model="mistral-embed", api_key="your-api-key")
-    result = await client.get_embeddings(["Hello, world!", "How are you?"])
-    for embedding in result:
-        print(f"Dimensions: {embedding.dimensions}")
-        print(f"Vector: {embedding.vector[:5]}...")
-finally:
-    await client.close()
-```
-
-### Configuration
-
-| Environment Variable | Description |
-|---|---|
-| `MISTRAL_API_KEY` | Your Mistral AI API key |
-| `MISTRAL_EMBEDDING_MODEL` | Embedding model name (e.g., `mistral-embed`) |
-| `MISTRAL_SERVER_URL` | Optional server URL override |
+| Feature | multimodal_agent | file_search_agent |
+|---------|-----------------|-------------------|
+| CU extraction | ✅ Full content injected | ✅ Content indexed in vector store |
+| RAG | ❌ | ✅ file_search retrieves top-k chunks |
+| Large docs (100+ pages) | ⚠️ May exceed context window | ✅ Token-efficient |
+| Multiple large files | ⚠️ Context overflow risk | ✅ All indexed, searchable |
+| Best for | Small docs, quick inspection | Large docs, multi-file Q&A |
