@@ -4,6 +4,6 @@ from enum import IntEnum
 
 
 class FeatureIndex(IntEnum):
-    """OpenAI Responses hosting-owned feature-usage indexes."""
+    """Hyperlight-owned feature-usage indexes."""
 
-    HOSTING_RESPONSES = 86
+    HYPERLIGHT = 81

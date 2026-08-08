@@ -1,94 +1,43 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Agent Framework DevUI Models - OpenAI-compatible types and custom extensions."""
+"""Telegram Bot API-shaped helpers for app-owned Agent Framework hosting."""
 
-# Import discovery models
-# Import all OpenAI types directly from the openai package
-from openai.types.conversations import Conversation, ConversationDeletedResource
-from openai.types.conversations.conversation_item import ConversationItem
-from openai.types.responses import (
-    Response,
-    ResponseCompletedEvent,
-    ResponseErrorEvent,
-    ResponseFunctionCallArgumentsDeltaEvent,
-    ResponseFunctionToolCall,
-    ResponseFunctionToolCallOutputItem,
-    ResponseInputParam,
-    ResponseOutputItemAddedEvent,
-    ResponseOutputItemDoneEvent,
-    ResponseOutputMessage,
-    ResponseOutputText,
-    ResponseReasoningTextDeltaEvent,
-    ResponseStreamEvent,
-    ResponseTextDeltaEvent,
-    ResponseUsage,
-    ToolParam,
+import importlib.metadata
+
+from ._parsing import (
+    ResolveFileUrl,
+    telegram_callback_query_id,
+    telegram_chat_id,
+    telegram_command,
+    telegram_media_file_id,
+    telegram_session_id,
+    telegram_to_run,
 )
-from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
-from openai.types.shared import Metadata, ResponsesModel
-
-from ._discovery_models import Deployment, DeploymentConfig, DeploymentEvent, DiscoveryResponse, EntityInfo
-from ._openai_custom import (
-    AgentFrameworkRequest,
-    CustomResponseOutputItemAddedEvent,
-    CustomResponseOutputItemDoneEvent,
-    ExecutorActionItem,
-    MetaResponse,
-    OpenAIError,
-    ResponseFunctionResultComplete,
-    ResponseOutputData,
-    ResponseOutputFile,
-    ResponseOutputImage,
-    ResponseTraceEvent,
-    ResponseTraceEventComplete,
-    ResponseWorkflowEventComplete,
+from ._rendering import (
+    TELEGRAM_MAX_CAPTION_LENGTH,
+    TELEGRAM_MAX_TEXT_LENGTH,
+    TelegramOperation,
+    telegram_from_run,
+    telegram_from_streaming_run,
 )
 
-# Type alias for compatibility
-OpenAIResponse = Response
+try:
+    __version__ = importlib.metadata.version(__name__)
+except importlib.metadata.PackageNotFoundError:
+    __version__ = "0.0.0"
 
-# Export all types for easy importing
 __all__ = [
-    "AgentFrameworkRequest",
-    "Conversation",
-    "ConversationDeletedResource",
-    "ConversationItem",
-    "CustomResponseOutputItemAddedEvent",
-    "CustomResponseOutputItemDoneEvent",
-    "Deployment",
-    "DeploymentConfig",
-    "DeploymentEvent",
-    "DiscoveryResponse",
-    "EntityInfo",
-    "ExecutorActionItem",
-    "InputTokensDetails",
-    "MetaResponse",
-    "Metadata",
-    "OpenAIError",
-    "OpenAIResponse",
-    "OutputTokensDetails",
-    "Response",
-    "ResponseCompletedEvent",
-    "ResponseErrorEvent",
-    "ResponseFunctionCallArgumentsDeltaEvent",
-    "ResponseFunctionResultComplete",
-    "ResponseFunctionToolCall",
-    "ResponseFunctionToolCallOutputItem",
-    "ResponseInputParam",
-    "ResponseOutputData",
-    "ResponseOutputFile",
-    "ResponseOutputImage",
-    "ResponseOutputItemAddedEvent",
-    "ResponseOutputItemDoneEvent",
-    "ResponseOutputMessage",
-    "ResponseOutputText",
-    "ResponseReasoningTextDeltaEvent",
-    "ResponseStreamEvent",
-    "ResponseTextDeltaEvent",
-    "ResponseTraceEvent",
-    "ResponseTraceEventComplete",
-    "ResponseUsage",
-    "ResponseWorkflowEventComplete",
-    "ResponsesModel",
-    "ToolParam",
+    "TELEGRAM_MAX_CAPTION_LENGTH",
+    "TELEGRAM_MAX_TEXT_LENGTH",
+    "ResolveFileUrl",
+    "TelegramOperation",
+    "__version__",
+    "telegram_callback_query_id",
+    "telegram_chat_id",
+    "telegram_command",
+    "telegram_from_run",
+    "telegram_from_streaming_run",
+    "telegram_media_file_id",
+    "telegram_session_id",
+    "telegram_to_run",
 ]
