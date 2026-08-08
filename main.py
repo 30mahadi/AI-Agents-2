@@ -1,88 +1,112 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "agent-framework-foundry",
+#     "agent-framework-neo4j",
+# ]
+# ///
+
 # Copyright (c) Microsoft. All rights reserved.
 
 import asyncio
 import os
-from typing import Annotated, Any, Literal
 
-from agent_framework import Agent, tool
-from agent_framework.foundry import FoundryChatClient, ResponsesHostServer
-from agent_framework.hyperlight import HyperlightCodeActProvider
-from azure.identity import DefaultAzureCredential
+from agent_framework import Agent
+from agent_framework.foundry import FoundryChatClient
+from agent_framework_neo4j import Neo4jContextProvider, Neo4jSettings
+from azure.identity.aio import AzureCliCredential
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
 
+"""
+This sample demonstrates how to use the Neo4j GraphRAG context provider with
+Agent Framework and Microsoft Foundry.
 
-@tool(approval_mode="never_require")
-def compute(
-    operation: Annotated[
-        Literal["add", "subtract", "multiply", "divide"],
-        "Math operation: add, subtract, multiply, or divide.",
-    ],
-    a: Annotated[float, "First numeric operand."],
-    b: Annotated[float, "Second numeric operand."],
-) -> float:
-    """Perform a math operation for sandboxed code."""
-    operations = {
-        "add": a + b,
-        "subtract": a - b,
-        "multiply": a * b,
-        "divide": a / b if b else float("inf"),
-    }
-    return operations[operation]
+Environment variables:
+    FOUNDRY_PROJECT_ENDPOINT — Microsoft Foundry project endpoint
+    FOUNDRY_MODEL            — Model deployment name (e.g. gpt-4o)
+    NEO4J_URI              — Neo4j connection URI
+    NEO4J_USERNAME         — Neo4j username
+    NEO4J_PASSWORD         — Neo4j password
+    NEO4J_FULLTEXT_INDEX_NAME — Optional fulltext index name (defaults to search_chunks)
+"""
+
+USER_INPUTS = [
+    "What products does Microsoft offer?",
+    "What risks does Apple face?",
+    "Tell me about NVIDIA's AI business and risk factors.",
+]
+
+# Optional graph-enrichment query: retrieval works without this, but supplying
+# a query lets the sample attach related company, product, and risk metadata to
+# each retrieved chunk.
+RETRIEVAL_QUERY = """
+MATCH (node)-[:FROM_DOCUMENT]->(doc:Document)<-[:FILED]-(company:Company)
+OPTIONAL MATCH (company)-[:FACES_RISK]->(risk:RiskFactor)
+WITH node, score, company, doc, collect(DISTINCT risk.name)[0..5] AS risks
+OPTIONAL MATCH (company)-[:MENTIONS]->(product:Product)
+WITH node, score, company, doc, risks, collect(DISTINCT product.name)[0..5] AS products
+RETURN
+    node.text AS text,
+    score,
+    company.name AS company,
+    company.ticker AS ticker,
+    doc.title AS title,
+    risks,
+    products
+ORDER BY score DESC
+"""
 
 
-@tool(approval_mode="never_require")
-async def fetch_data(
-    table: Annotated[str, "Name of the simulated table to query."],
-) -> list[dict[str, Any]]:
-    """Fetch records from a named table."""
-    await asyncio.sleep(0.5)
-    data: dict[str, list[dict[str, Any]]] = {
-        "users": [
-            {"id": 1, "name": "Alice", "role": "admin"},
-            {"id": 2, "name": "Bob", "role": "user"},
-            {"id": 3, "name": "Charlie", "role": "admin"},
-        ],
-        "products": [
-            {"id": 101, "name": "Widget", "price": 9.99},
-            {"id": 102, "name": "Gadget", "price": 19.99},
-        ],
-    }
-    return data.get(table, [])
+async def main() -> None:
+    # 1. Load and validate the Neo4j connection settings.
+    settings = Neo4jSettings()
+    if not settings.is_configured:
+        raise RuntimeError("Set NEO4J_URI, NEO4J_USERNAME, and NEO4J_PASSWORD before running this sample.")
 
+    # 2. Read the Microsoft Foundry project endpoint and model configuration.
+    project_endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT")
+    if not project_endpoint:
+        raise RuntimeError("Set FOUNDRY_PROJECT_ENDPOINT before running this sample.")
 
-def main():
-    # 1. Create the Foundry chat client.
-    client = FoundryChatClient(
-        project_endpoint=os.environ["FOUNDRY_PROJECT_ENDPOINT"],
-        model=os.environ["AZURE_AI_MODEL_DEPLOYMENT_NAME"],
-        credential=DefaultAzureCredential(),
-        function_invocation_configuration={"include_detailed_errors": True},
-    )
+    model = os.environ.get("FOUNDRY_MODEL") or "gpt-4o"
 
-    # 2. Register sandbox tools on a Hyperlight CodeAct provider. The model only
-    #    sees `execute_code`; `compute` and `fetch_data` are reachable from
-    #    inside the sandbox via `call_tool(...)`.
-    codeact = HyperlightCodeActProvider(
-        tools=[compute, fetch_data],
-        approval_mode="never_require",
-    )
+    # 3. Create the Neo4j context provider and Foundry-backed agent, then ask sample questions.
+    async with (
+        AzureCliCredential() as credential,
+        Neo4jContextProvider(
+            source_id="neo4j_graphrag",
+            uri=settings.uri,
+            username=settings.username,
+            password=settings.get_password(),
+            index_name=settings.fulltext_index_name,
+            index_type="fulltext",
+            retrieval_query=RETRIEVAL_QUERY,
+            top_k=5,
+        ) as provider,
+        Agent(
+            client=FoundryChatClient(
+                project_endpoint=project_endpoint,
+                model=model,
+                credential=credential,
+            ),
+            name="Neo4jGraphRAGAgent",
+            instructions=(
+                "You are a helpful assistant. Use the Neo4j context provider results to answer accurately. "
+                "If the retrieved context is insufficient, say so plainly."
+            ),
+            context_providers=[provider],
+        ) as agent,
+    ):
+        session = agent.create_session()
+        print("=== Neo4j GraphRAG Context Provider ===\n")
 
-    # 3. Build the agent. History is managed by the hosting infrastructure, so
-    #    request the model not to persist server-side conversation state.
-    agent = Agent(
-        client=client,
-        instructions="You are a helpful assistant. Keep your answers brief.",
-        context_providers=[codeact],
-        default_options={"store": False},
-    )
-
-    # 4. Serve the agent over the Foundry Responses protocol.
-    server = ResponsesHostServer(agent)
-    server.run()
+        for user_input in USER_INPUTS:
+            print(f"User: {user_input}")
+            result = await agent.run(user_input, session=session)
+            print(f"Agent: {getattr(result, 'text', result)}\n")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

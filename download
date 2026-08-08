@@ -1,7 +1,4 @@
-# dependencies
-/node_modules
-
-# build artifacts
-*.tsbuildinfo
-vite.config.js
-vite.config.d.ts
+*.db
+*.db-shm
+*.db-wal
+uploads/
