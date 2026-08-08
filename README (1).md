@@ -1,96 +1,61 @@
-# AG-UI Single Agent Demo
+# AutoGen → Microsoft Agent Framework Migration Samples
 
-The simplest possible AG-UI integration: a **single chat agent** with **no tools** and **no context providers**,
-served over the AG-UI protocol and consumed by a small React client.
+This gallery helps AutoGen developers move to the Microsoft Agent Framework (AF) with minimal guesswork. Each script pairs AutoGen code with its AF equivalent so you can compare primitives, tooling, and orchestration patterns side by side while you migrate production workloads.
 
-Use this sample as the starting point for AG-UI. For a richer, multi-agent example with tool-approval checkpoints
-and human-in-the-loop resumes, see [`../ag_ui_workflow_handoff`](../ag_ui_workflow_handoff/README.md).
+## What's Included
 
-## Folder Layout
+### Single-Agent Parity
 
-- `backend/server.py` - FastAPI + AG-UI endpoint wrapping a single `Agent`
-- `frontend/` - Vite + React AG-UI client UI
+- [01_basic_agent.py](single_agent/01_basic_agent.py) — Minimal AutoGen `AssistantAgent` and AF `Agent` comparison.
+- [02_agent_with_tool.py](single_agent/02_agent_with_tool.py) — Function tool integration in both SDKs.
+- [03_agent_thread_and_stream.py](single_agent/03_agent_thread_and_stream.py) — Session management and streaming responses.
+- [04_agent_as_tool.py](single_agent/04_agent_as_tool.py) — Using agents as tools (hierarchical agent pattern) and streaming with tools.
+
+### Multi-Agent Orchestration
+
+- [01_round_robin_group_chat.py](orchestrations/01_round_robin_group_chat.py) — AutoGen `RoundRobinGroupChat` → AF `GroupChatBuilder`/`SequentialBuilder`.
+- [02_selector_group_chat.py](orchestrations/02_selector_group_chat.py) — AutoGen `SelectorGroupChat` → AF `GroupChatBuilder`.
+- [03_swarm.py](orchestrations/03_swarm.py) — AutoGen Swarm pattern → AF `HandoffBuilder`.
+- [04_magentic_one.py](orchestrations/04_magentic_one.py) — AutoGen `MagenticOneGroupChat` → AF `MagenticBuilder`.
+
+Each script is fully async and the `main()` routine runs both implementations back to back so you can observe their outputs in a single execution.
 
 ## Prerequisites
 
-- Python 3.10+
-- Node.js 20.19+ or 22.12+
-- npm 9+
-- Azure AI project + model deployment configured in environment variables:
-  - `FOUNDRY_PROJECT_ENDPOINT`
-  - `FOUNDRY_MODEL`
-- Azure CLI authenticated with `az login`
+- Python 3.10 or later.
+- Access to the necessary model endpoints (Azure OpenAI, OpenAI, etc.).
+- Installed SDKs: Install AutoGen and the Microsoft Agent Framework with:
+  ```bash
+  pip install "autogen-agentchat autogen-ext[openai] agent-framework"
+  ```
+- Service credentials exposed through environment variables (e.g., `OPENAI_API_KEY`).
 
-## 1) Run Backend
+## Running Single-Agent Samples
 
 From the repository root:
 
 ```bash
-cd python
-uv sync
-uv run python samples/05-end-to-end/ag_ui_single_agent/backend/server.py
+python samples/autogen-migration/single_agent/01_basic_agent.py
 ```
 
-Backend default URL:
+Every script accepts no CLI arguments and will first call the AutoGen implementation, followed by the AF version. Adjust the prompt or credentials inside the file as necessary before running.
 
-- `http://127.0.0.1:8892`
-- AG-UI endpoint: `POST http://127.0.0.1:8892/agent`
+## Running Orchestration Samples
 
-To export traces to the Application Insights resource connected to the Foundry project, run the backend with:
+Advanced comparisons are in `autogen-migration/orchestrations` (RoundRobin, Selector, Swarm, Magentic). You can run them directly:
 
 ```bash
-ENABLE_AZURE_MONITOR=true uv run python samples/05-end-to-end/ag_ui_single_agent/backend/server.py
+python samples/autogen-migration/orchestrations/01_round_robin_group_chat.py
+python samples/autogen-migration/orchestrations/04_magentic_one.py
 ```
 
-Each user turn is a separate run and trace. The stable AG-UI `thread_id` is recorded as
-`gen_ai.conversation.id`, which lets Foundry group those turns into one conversation.
+## Tips for Migration
 
-## 2) Install Frontend Packages (npm)
-
-From the `python/` directory (where Step 1 left you):
-
-```bash
-cd samples/05-end-to-end/ag_ui_single_agent/frontend
-npm install
-```
-
-## 3) Run Frontend Locally
-
-```bash
-npm run dev
-```
-
-Frontend default URL:
-
-- `http://127.0.0.1:5173`
-
-If you changed backend host/port, run with:
-
-```bash
-VITE_BACKEND_URL=http://127.0.0.1:8892 npm run dev
-```
-
-## 4) Demo Flow to Verify
-
-1. Click one of the starter prompts (or type your own message).
-2. Watch the assistant response stream in token by token.
-3. Send a follow-up that depends on the previous turn (for example: "summarize what you just told me").
-   The client only sends the newest message plus the `thread_id`; the server replays the stored history.
-4. Click **New Thread** to start a fresh conversation (a new `thread_id`).
-
-## Conversation History
-
-The client only ever sends the **newest message** plus a `thread_id`. The backend retains history **server-side**,
-keyed by that `thread_id`, using an `InMemoryAGUIThreadSnapshotStore`. Because an AG-UI thread id is not an
-authorization boundary, a `snapshot_scope_resolver` is required whenever a snapshot store is configured; this
-single-tenant demo maps every request to one shared `"demo"` scope.
-
-The in-memory store is process-local and not durable. Swap in your own `AGUIThreadSnapshotStore` implementation
-(and a real scope resolver) for production.
-
-## What This Validates
-
-- `add_agent_framework_fastapi_endpoint(...)` with a plain `Agent` (no `AgentFrameworkWorkflow` wrapper)
-- Streaming assistant text via `TEXT_MESSAGE_START` / `TEXT_MESSAGE_CONTENT` / `TEXT_MESSAGE_END` AG-UI events
-- Server-side conversation history keyed by `thread_id` via a snapshot store
-- Foundry trace correlation across runs using the stable AG-UI `thread_id`
+- **Default behavior differences**: AutoGen's `AssistantAgent` is single-turn by default (`max_tool_iterations=1`), while AF's `Agent` is multi-turn and continues tool execution automatically.
+- **Thread management**: AF agents are stateless by default. Use `agent.create_session()` and pass it to `run()` to maintain conversation state, similar to AutoGen's conversation context.
+- **Tools**: AutoGen uses `FunctionTool` wrappers; AF uses `@tool` decorators with automatic schema inference.
+- **Orchestration patterns**:
+  - `RoundRobinGroupChat` → `SequentialBuilder` or `WorkflowBuilder`
+  - `SelectorGroupChat` → `GroupChatBuilder` with LLM-based speaker selection
+  - `Swarm` → `HandoffBuilder` for agent handoff coordination
+  - `MagenticOneGroupChat` → `MagenticBuilder` for orchestrated multi-agent workflows

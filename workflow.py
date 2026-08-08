@@ -1,25 +1,50 @@
 # Copyright (c) Microsoft. All rights reserved.
 
 """
-Run the declarative workflow sample with DevUI.
+Sample Validation Workflow using Microsoft Agent Framework.
 
-Demonstrates conditional branching based on age input using YAML-defined workflow.
+Workflow composition for sample validation.
 """
 
-from pathlib import Path
+from agent_framework import Workflow, WorkflowBuilder
 
-from agent_framework.declarative import WorkflowFactory
-from agent_framework.devui import serve
-
-factory = WorkflowFactory()
-workflow_path = Path(__file__).parent / "workflow.yaml"
-workflow = factory.create_workflow_from_yaml_path(workflow_path)
-
-
-def main():
-    """Run the declarative workflow with DevUI."""
-    serve(entities=[workflow], auto_open=True)
+from sample_validation.create_dynamic_workflow_executor import (
+    CreateConcurrentValidationWorkflowExecutor,
+)
+from sample_validation.discovery import DiscoverSamplesExecutor, ValidationConfig
+from sample_validation.replay_executor import ReplayCachedPlaybooksExecutor
+from sample_validation.report import GenerateReportExecutor
+from sample_validation.run_dynamic_validation_workflow_executor import (
+    RunDynamicValidationWorkflowExecutor,
+)
 
 
-if __name__ == "__main__":
-    main()
+def create_validation_workflow(
+    config: ValidationConfig,
+) -> Workflow:
+    """
+    Create the sample validation workflow.
+
+    Args:
+        config: Validation configuration
+
+    Returns:
+        Configured Workflow instance
+    """
+    discover = DiscoverSamplesExecutor(config)
+    replay = ReplayCachedPlaybooksExecutor(config)
+    create_dynamic_workflow = CreateConcurrentValidationWorkflowExecutor(config)
+    run_dynamic_workflow = RunDynamicValidationWorkflowExecutor()
+    generate = GenerateReportExecutor()
+
+    return (
+        WorkflowBuilder(start_executor=discover)
+        .add_edge(discover, replay)
+        .add_edge(replay, create_dynamic_workflow)
+        .add_edge(create_dynamic_workflow, run_dynamic_workflow)
+        .add_edge(run_dynamic_workflow, generate)
+        .build()
+    )
+
+
+__all__ = ["ValidationConfig", "create_validation_workflow"]

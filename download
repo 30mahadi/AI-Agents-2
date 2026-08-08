@@ -1,4 +1,2 @@
-*.db
-*.db-shm
-*.db-wal
-uploads/
+# Ignore autogen source files
+autogen
