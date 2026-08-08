@@ -1,15 +1,33 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Minimal Responses-only hosting sample with native FastAPI routes.
+"""Responses-only hosting sample that serves a harness agent.
 
-This sample demonstrates the helper-first hosting shape:
+This sample is the sibling of ``local_responses/``. It keeps the exact same
+helper-first hosting shape but swaps the plain ``Agent`` target for a
+batteries-included harness agent built with ``create_harness_agent``:
 
-1. ``agent-framework-hosting-responses`` converts Responses request/response
+1. ``create_harness_agent`` (from core ``agent-framework``) assembles the full
+   agent pipeline from a chat client: the function-invocation loop,
+   per-service-call history persistence, context-window compaction, a todo
+   provider, and heuristic tool approval.
+2. ``agent-framework-hosting-responses`` converts Responses request/response
    payloads to and from Agent Framework run values.
-2. ``agent-framework-hosting`` owns ``AgentState``; core provides its
-   ``SessionStore``.
-3. FastAPI owns the route, request parsing, policy decisions, and response
+3. ``agent-framework-hosting`` owns shared execution state via ``AgentState``
+   and its ``SessionStore``.
+4. FastAPI owns the route, request parsing, policy decisions, and response
    object.
+
+The point of the sample is that a harness agent is just an ``Agent``, so it
+drops straight into the same ``AgentState`` / Responses-helper seam as any
+other target. The interactive-only harness features (plan/execute mode and the
+Textual console) are turned off because a one-shot HTTP request has no console
+to drive; web search is turned off to keep the sample self-contained. Todo
+management and compaction stay on so the target is a genuine harness agent and
+not just a relabelled plain ``Agent``.
+
+Because the server runs headless, the ``lookup_weather`` tool is registered
+with ``approval_mode="never_require"`` so a run never blocks waiting for a human
+to approve a tool call.
 
 Production readiness
 ---
@@ -26,6 +44,10 @@ storage by tenant/user as appropriate for your application. See
 Unknown ``conversation_id`` values create a new local session in this sample.
 Your app can choose a different policy, such as requiring a separate API to
 create new conversations before callers can continue them.
+
+Environment variables:
+    FOUNDRY_PROJECT_ENDPOINT — Azure AI Foundry project endpoint URL
+    FOUNDRY_MODEL            — Model deployment name
 
 Run
 ---
@@ -44,7 +66,7 @@ iteration::
 
 Then call it::
 
-    uv run python call_server.py "What is the weather in Tokyo?"
+    uv run python call_server.py
 """
 
 from __future__ import annotations
@@ -52,10 +74,9 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Annotated, Any, cast
 
-from agent_framework import Agent, FileHistoryProvider, FileSessionStore, ResponseStream, tool
+from agent_framework import Agent, ResponseStream, create_harness_agent, tool
 from agent_framework_foundry import FoundryChatClient
 from agent_framework_hosting import AgentState
 from agent_framework_hosting_responses import (
@@ -65,14 +86,20 @@ from agent_framework_hosting_responses import (
     responses_session_id,
     responses_to_run,
 )
-from azure.identity.aio import DefaultAzureCredential
+from azure.identity import AzureCliCredential
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
-SESSIONS_DIR = Path(__file__).resolve().parent / "storage" / "sessions"
-SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+# Token budget for the harness compaction feature.
+MAX_CONTEXT_WINDOW_TOKENS = 128_000
+MAX_OUTPUT_TOKENS = 16_384
+
+WEATHER_INSTRUCTIONS = (
+    "You are a friendly weather assistant. Use the lookup_weather tool for any "
+    "weather question and answer in one short sentence."
+)
 
 
 @tool(approval_mode="never_require")
@@ -90,25 +117,40 @@ def lookup_weather(
 
 
 def create_agent() -> Agent:
-    """Create the sample weather agent."""
-    return Agent(
-        client=FoundryChatClient(credential=DefaultAzureCredential()),
-        name="WeatherAgent",
-        instructions=(
-            "You are a friendly weather assistant. Use the lookup_weather tool "
-            "for any weather question and answer in one short sentence."
-        ),
+    """Create the sample harness-based weather agent.
+
+    ``create_harness_agent`` returns a plain ``Agent``, so the resulting target
+    plugs into ``AgentState`` and the Responses helpers exactly like the
+    ``local_responses`` sample's agent does. The harness supplies function
+    invocation, per-service-call persistence, compaction, and todo management on
+    top of the ``lookup_weather`` tool.
+    """
+    return create_harness_agent(
+        # For authentication, run `az login` in a terminal or replace
+        # AzureCliCredential with your preferred authentication option.
+        client=FoundryChatClient(credential=AzureCliCredential()),
+        name="HarnessWeatherAgent",
+        description="A batteries-included harness agent that answers weather questions.",
+        agent_instructions=WEATHER_INSTRUCTIONS,
         tools=[lookup_weather],
-        context_providers=[FileHistoryProvider(SESSIONS_DIR)],
+        max_context_window_tokens=MAX_CONTEXT_WINDOW_TOKENS,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+        # Turn off the interactive-only and provider-specific features so the
+        # agent is a good fit for a headless, one-shot HTTP endpoint. Todo
+        # management and compaction stay enabled.
+        disable_mode=True,
+        disable_web_search=True,
+        # Disable file memory. File access is opt-in and no store is supplied, so
+        # the headless HTTP sample has no file read/write tools or side effects.
+        disable_file_memory=True,
+        # The app owns session state locally, so do not also persist server-side
+        # Responses conversations.
         default_options={"store": False},
     )
 
 
 app = FastAPI()
-state = AgentState(
-    create_agent,
-    session_store=FileSessionStore(SESSIONS_DIR / "snapshots"),
-)
+state = AgentState(create_agent)
 
 ALLOWED_REQUEST_OPTIONS = frozenset({"max_tokens", "reasoning"})
 
@@ -129,7 +171,6 @@ async def responses(body: dict[str, Any] = Body(...)) -> JSONResponse | Streamin
     # and all other caller-supplied options by default. Your app decides which
     # options are allowed, altered, or denied.
     options = {key: value for key, value in run["options"].items() if key in ALLOWED_REQUEST_OPTIONS}
-    options["reasoning"] = {"effort": "medium", "summary": "auto"}
     options_for_run = cast(Any, options)
 
     target = await state.get_target()
@@ -158,9 +199,6 @@ async def responses(body: dict[str, Any] = Body(...)) -> JSONResponse | Streamin
             # is consumed/finalized. Persist the selected continuation only
             # after finalization.
             if conversation_id is not None:
-                # A stable conversation id is a mutable head. Apps must ensure
-                # only one caller advances it at a time; AgentState does not
-                # serialize concurrent runs for the same id.
                 await state.set_session(conversation_id, session)
             else:
                 await state.set_session(response_id, session)
@@ -178,8 +216,6 @@ async def responses(body: dict[str, Any] = Body(...)) -> JSONResponse | Streamin
     # `agent.run(...)` updates the session. Persist the selected continuation
     # only after the run completes.
     if conversation_id is not None:
-        # Preserve sequential conversation continuity. Production apps must
-        # provide their own per-conversation single-writer coordination.
         await state.set_session(conversation_id, session)
     else:
         await state.set_session(response_id, session)

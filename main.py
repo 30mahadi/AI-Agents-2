@@ -1,32 +1,88 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Launch DevUI with folder discovery for the samples in this directory.
+import asyncio
+import os
+from typing import Annotated, Any, Literal
 
-This sample demonstrates:
-- Loading a shared root `.env` file for the DevUI samples folder
-- Starting DevUI in directory discovery mode for this folder
-- Using root-level settings as fallbacks for discovered samples
-"""
-
-from pathlib import Path
-
-from agent_framework.devui import serve
+from agent_framework import Agent, tool
+from agent_framework.foundry import FoundryChatClient, ResponsesHostServer
+from agent_framework.hyperlight import HyperlightCodeActProvider
+from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
 
+# Load environment variables from .env file
+load_dotenv()
 
-def main() -> None:
-    """Load the root .env file and launch DevUI with folder discovery."""
-    samples_dir = Path(__file__).resolve().parent
 
-    # 1. Load shared defaults for the samples in this folder.
-    load_dotenv(samples_dir / ".env")
+@tool(approval_mode="never_require")
+def compute(
+    operation: Annotated[
+        Literal["add", "subtract", "multiply", "divide"],
+        "Math operation: add, subtract, multiply, or divide.",
+    ],
+    a: Annotated[float, "First numeric operand."],
+    b: Annotated[float, "Second numeric operand."],
+) -> float:
+    """Perform a math operation for sandboxed code."""
+    operations = {
+        "add": a + b,
+        "subtract": a - b,
+        "multiply": a * b,
+        "divide": a / b if b else float("inf"),
+    }
+    return operations[operation]
 
-    # 2. Start DevUI and discover entities from this directory.
-    serve(entities_dir=str(samples_dir), auto_open=True)
+
+@tool(approval_mode="never_require")
+async def fetch_data(
+    table: Annotated[str, "Name of the simulated table to query."],
+) -> list[dict[str, Any]]:
+    """Fetch records from a named table."""
+    await asyncio.sleep(0.5)
+    data: dict[str, list[dict[str, Any]]] = {
+        "users": [
+            {"id": 1, "name": "Alice", "role": "admin"},
+            {"id": 2, "name": "Bob", "role": "user"},
+            {"id": 3, "name": "Charlie", "role": "admin"},
+        ],
+        "products": [
+            {"id": 101, "name": "Widget", "price": 9.99},
+            {"id": 102, "name": "Gadget", "price": 19.99},
+        ],
+    }
+    return data.get(table, [])
+
+
+def main():
+    # 1. Create the Foundry chat client.
+    client = FoundryChatClient(
+        project_endpoint=os.environ["FOUNDRY_PROJECT_ENDPOINT"],
+        model=os.environ["AZURE_AI_MODEL_DEPLOYMENT_NAME"],
+        credential=DefaultAzureCredential(),
+        function_invocation_configuration={"include_detailed_errors": True},
+    )
+
+    # 2. Register sandbox tools on a Hyperlight CodeAct provider. The model only
+    #    sees `execute_code`; `compute` and `fetch_data` are reachable from
+    #    inside the sandbox via `call_tool(...)`.
+    codeact = HyperlightCodeActProvider(
+        tools=[compute, fetch_data],
+        approval_mode="never_require",
+    )
+
+    # 3. Build the agent. History is managed by the hosting infrastructure, so
+    #    request the model not to persist server-side conversation state.
+    agent = Agent(
+        client=client,
+        instructions="You are a helpful assistant. Keep your answers brief.",
+        context_providers=[codeact],
+        default_options={"store": False},
+    )
+
+    # 4. Serve the agent over the Foundry Responses protocol.
+    server = ResponsesHostServer(agent)
+    server.run()
 
 
 if __name__ == "__main__":
     main()
-
-# Sample output:
-# Starting Agent Framework DevUI on 127.0.0.1:8080

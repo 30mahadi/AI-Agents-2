@@ -1,78 +1,147 @@
-# Chat Client Examples
+# local_telegram - Telegram helpers with aiogram polling or webhooks
 
-This folder contains examples for direct chat client usage patterns.
+A local Telegram bot built from the helper-first hosting pieces:
 
-## Examples
+- an actual Foundry-backed Agent Framework `Agent`;
+- `AgentState` and `InMemoryHistoryProvider` for process-local per-chat
+  continuity;
+- `telegram_to_run(...)` for Telegram update to AF conversion;
+- `telegram_from_streaming_run(...)` for AF stream to Telegram edit payloads;
+- `aiogram` for typed updates, polling/webhook dispatch, file download, and Bot
+  API calls.
 
-| File | Description |
-|------|-------------|
-| [`built_in_chat_clients.py`](built_in_chat_clients.py) | Consolidated sample for built-in chat clients. Uses `get_client()` to create the selected client and pass it to `main()`. |
-| [`chat_response_cancellation.py`](chat_response_cancellation.py) | Demonstrates how to cancel chat responses during streaming, showing proper cancellation handling and cleanup. |
-| [`custom_chat_client.py`](custom_chat_client.py) | Demonstrates how to create custom chat clients by extending the `BaseChatClient` class. Shows a `EchoingChatClient` implementation and how to integrate it with `Agent` using the `as_agent()` method. |
-| [`require_per_service_call_history_persistence.py`](require_per_service_call_history_persistence.py) | Compares two otherwise identical `FoundryChatClient` agents with `store=False`; the only difference is whether `require_per_service_call_history_persistence` is enabled, and only the run without it stores the synthesized tool result when middleware terminates the loop early. |
+There is no Telegram client, polling runtime, webhook router, command registry,
+or delivery framework in `agent-framework-hosting-telegram`. This sample uses
+the native `aiogram` SDK for those concerns. The helpers are deliberately
+agnostic to the Telegram SDK you choose. See the
+[Telegram documentation](https://core.telegram.org/bots/samples#python) for
+other Python SDK options.
 
-## Selecting a built-in client
+Each entry point is intentionally self-contained so it can be read and copied
+without following a shared sample helper module. Both handle text, captions,
+supported media, callback-query data, and the commands `/start`, `/help`,
+`/new`, and `/weather <city>`.
 
-`built_in_chat_clients.py` starts with:
+## Run with polling
 
-```python
-asyncio.run(main("openai_responses"))
-```
-
-Change the argument to pick a client:
-
-- `openai_responses`
-- `openai_chat_completion`
-- `anthropic`
-- `ollama`
-- `bedrock`
-- `azure_openai_responses`
-- `azure_openai_chat_completion`
-- `foundry_chat`
-
-Example:
+Create a Telegram bot with BotFather, then configure:
 
 ```bash
-uv run samples/02-agents/chat_client/built_in_chat_clients.py
-```
-
-The `require_per_service_call_history_persistence.py` sample uses `FoundryChatClient`, so set the usual Foundry settings first and sign in with the Azure CLI:
-
-```bash
-export FOUNDRY_PROJECT_ENDPOINT="https://<your-project>.services.ai.azure.com/api/projects/<project-name>"
-export FOUNDRY_MODEL="<your-model-deployment-name>"
+export FOUNDRY_PROJECT_ENDPOINT=https://<your-project>.services.ai.azure.com
+export FOUNDRY_MODEL=gpt-5-nano
+export TELEGRAM_BOT_TOKEN=...
 az login
-uv run samples/02-agents/chat_client/require_per_service_call_history_persistence.py
+
+uv run polling_app.py
 ```
 
-## Environment Variables
+The sample asks `aiogram` to clear any existing webhook before polling because
+Telegram does not allow polling while a webhook is registered.
 
-Depending on the selected client, set the appropriate environment variables:
+## Run with a webhook
 
-**For Azure OpenAI clients (`azure_openai_responses` and `azure_openai_chat_completion`):**
-- `AZURE_OPENAI_ENDPOINT`: Your Azure OpenAI endpoint
-- `AZURE_OPENAI_MODEL`: The Azure OpenAI deployment used by the sample
-- `AZURE_OPENAI_API_VERSION` (optional): Azure OpenAI API version override
-- `AZURE_OPENAI_API_KEY` (optional): Azure OpenAI API key if you are not using `AzureCliCredential`
+Configure the public HTTPS URL that Telegram should call and a random secret
+used to authenticate webhook deliveries:
 
-**For Foundry client (`foundry_chat`):**
-- `FOUNDRY_PROJECT_ENDPOINT`: Your Microsoft Foundry project endpoint
-- `FOUNDRY_MODEL`: The Foundry deployment used by the sample
+```bash
+export FOUNDRY_PROJECT_ENDPOINT=https://<your-project>.services.ai.azure.com
+export FOUNDRY_MODEL=gpt-5-nano
+export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_WEBHOOK_URL=https://<your-host>/telegram/webhook
+export TELEGRAM_WEBHOOK_SECRET=<random-secret>
+az login
 
-**For OpenAI clients:**
-- `OPENAI_API_KEY`: Your OpenAI API key
-- `OPENAI_CHAT_COMPLETION_MODEL`: The OpenAI model for `openai_chat_completion`
-- `OPENAI_CHAT_MODEL`: The OpenAI model for `openai_responses`
+uv run app.py
+```
 
-**For Anthropic client (`anthropic`):**
-- `ANTHROPIC_API_KEY`: Your Anthropic API key
-- `ANTHROPIC_CHAT_MODEL`: The Anthropic model to use (for example, `claude-sonnet-4-5`)
+Each entry point declares its complete Agent Framework and third-party
+dependency set using PEP 723 inline script metadata, so `uv` creates the
+appropriate environment directly from the selected script.
 
-**For Ollama client (`ollama`):**
-- `OLLAMA_HOST`: Ollama server URL (defaults to `http://localhost:11434` if unset)
-- `OLLAMA_MODEL`: Ollama model name (for example, `mistral`, `qwen2.5:8b`)
+`app.py` derives its FastAPI route from the path in
+`TELEGRAM_WEBHOOK_URL`, registers that URL with Telegram during application
+startup, and validates `X-Telegram-Bot-Api-Secret-Token` with
+`TELEGRAM_WEBHOOK_SECRET` before accepting an update.
 
-**For Bedrock client (`bedrock`):**
-- `BEDROCK_CHAT_MODEL`: Bedrock model ID (for example, `anthropic.claude-3-5-sonnet-20240620-v1:0`)
-- `BEDROCK_REGION`: AWS region (defaults to `us-east-1` if unset)
-- AWS credentials via standard environment variables (for example, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
+The app intentionally leaves the webhook registered during shutdown. Deleting
+it can race a rolling deployment and remove the webhook that the replacement
+process just registered.
+
+## Behavior to notice
+
+- **Session continuity:** `telegram_session_id(..., bot_id=bot.id)` follows
+  Telegram's native identity boundaries. Private chats use
+  `telegram:<bot_id>:<user_id>`; groups and supergroups use
+  `telegram:<bot_id>:<chat_id>`, creating a shared session for that group.
+  Including `bot.id` prevents two bots from accidentally sharing state.
+  aiogram derives that numeric bot id from `TELEGRAM_BOT_TOKEN`, so these local
+  apps do not need a separate `TELEGRAM_BOT_ID` setting.
+- **Starting over:** `/new` calls `state.session_store.delete(session_id)`.
+  The command itself does not run the agent. On the next ordinary message,
+  `get_or_create_session(...)` finds no stored value and creates a fresh
+  `AgentSession` with empty `InMemoryHistoryProvider` state. In a group, this
+  resets the shared group session; an app that wants per-user group sessions
+  should include both the chat id and sender id in its app-owned key.
+- **Process restarts:** history is intentionally process-local in this sample.
+  Restarting either app also starts fresh. A durable deployment must replace
+  both the in-memory session store and history provider deliberately.
+- **Commands:** recognized commands are handled by application code and bypass
+  the agent. Unknown slash commands fall through as ordinary agent input.
+- **Callback queries:** the app acknowledges callback queries first to clear
+  Telegram's loading indicator, then treats callback data as user input unless
+  it matched an app-owned command.
+- **Media:** files larger than 5 MiB are not forwarded. Downloaded media is
+  converted to an inline data URI so a token-bearing Telegram file URL is not
+  disclosed to the model provider. If media cannot be resolved, a caption can
+  still be used as text; unresolved media-only updates are ignored.
+- **Streaming:** the app sends a placeholder, applies cumulative text with
+  `editMessageText`, and throttles edits. Telegram can normalize distinct
+  payloads to the same rendered content; the app treats only its resulting
+  `message is not modified` edit error as an idempotent success. Other Bot API
+  errors still propagate. For an image-only result, the helper deletes the
+  placeholder before emitting `sendPhoto`.
+- **Transport ordering:** polling uses `tasks_concurrency_limit=1`, so this
+  compact sample processes updates serially. The webhook acknowledges first
+  and processes in a FastAPI background task, but serializes each chat's
+  updates with an in-process lock so `/new` cannot race an in-flight response.
+  A multi-process deployment must instead use its storage backend's locking or
+  transaction mechanisms, or another cross-process ordering strategy.
+- **Webhook trust:** `TELEGRAM_WEBHOOK_SECRET` authenticates delivery from
+  Telegram. It does not authorize the Telegram user or chat to access
+  application data.
+
+## What the app owns
+
+The helper package only converts protocol values. `aiogram`, `app.py`, and
+`polling_app.py` own:
+
+- polling or FastAPI webhook setup and update dispatch;
+- bounded media download and inline-data conversion, avoiding disclosure of
+  token-bearing Telegram file URLs to the model provider;
+- slash-command policy and session reset;
+- native send, photo, typing, callback acknowledgement, and edit calls;
+- edit throttling and error logging.
+
+That code remains visible so an application can replace it with a webhook,
+queue, or retry policy without changing the AF conversion helpers.
+
+## Production readiness
+
+These are compact hosting samples, not complete production Telegram
+deployments.
+Before deploying this pattern:
+
+- use HTTPS and keep webhook secret validation enabled;
+- store `TELEGRAM_BOT_TOKEN` in a secret manager and avoid logging Bot API URLs;
+- authorize users before mapping a chat id to sensitive/shared state;
+- replace process-local history/session state with durable storage partitioned
+  by tenant/user and define retention;
+- make update processing idempotent and preserve per-chat ordering; use
+  storage-backed locking/transactions or another distributed coordination
+  mechanism when running more than one process;
+- handle Telegram `429` responses and `retry_after` values;
+- add bounded retries, delivery telemetry, and dead-letter handling;
+- decide how partial streaming edits should recover when a final edit fails.
+
+> This sample is **self-hosted**. The multi-protocol Telegram + Invocations
+> Foundry-hosted sample remains part of the separate Invocations work.

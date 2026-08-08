@@ -1,69 +1,69 @@
-# File-Based Agent Skills
+# local_responses_workflow — Responses helpers with a workflow target
 
-This sample demonstrates how to use **file-based Agent Skills** with a `SkillsProvider` in the Microsoft Agent Framework. File-based skills are discovered from `SKILL.md` files on disk and can include reference documents and executable scripts.
+This sample shows the helper-first hosting shape for a local workflow:
 
-## What are Agent Skills?
+- `responses_to_run(...)` parses the Responses request body.
+- `WorkflowState` resolves the workflow target.
+- FastAPI owns the route and response construction.
+- The app owns file-based checkpoint storage and the
+  `response_id -> checkpoint_id` cursor used to continue from a previous
+  response.
+- Continuation is intentionally limited to `previous_response_id`; this sample
+  rejects `conversation_id` continuity with HTTP 400.
 
-Agent Skills are modular packages of instructions and resources that enable AI agents to perform specialized tasks. They follow the [Agent Skills specification](https://agentskills.io/) and implement progressive disclosure:
+The workflow writes a slogan with one Foundry-backed writer agent and a small
+deterministic formatter executor. That keeps the sample focused on native
+FastAPI routing, Responses helpers, `WorkflowState`, and app-owned checkpoint
+cursor storage. Both workflow checkpoints and the checkpoint cursor file are
+stored under the sample's local `storage/` root. Checkpoints are scoped into
+per-continuation buckets so a "latest checkpoint" lookup cannot cross
+conversations.
 
-1. **Advertise**: Skills are advertised with name + description (~100 tokens per skill)
-2. **Load**: Full instructions are loaded on-demand via `load_skill` tool
-3. **Resources**: References and other files loaded via `read_skill_resource` tool
-4. **Scripts**: Executable scripts run via `run_skill_script` tool
+The sample passes a builder with `cache_target=False`, producing a fresh
+workflow instance for every request. This is required for simultaneous runs
+because one `Workflow` instance intentionally permits only one active run.
 
-## Skills Included
+## Production readiness
 
-### unit-converter
-Converts between common units (miles↔km, pounds↔kg) using a multiplication factor following [agentskills.io guidelines](https://agentskills.io/skill-creation/using-scripts).
-- `references/CONVERSION_TABLES.md` — Supported conversions and their factors
-- `scripts/convert.py` — Executable script with `--value` and `--factor` flags, JSON output, and `--help` support
+This is not a full-fledged production deployment. Before exposing this pattern
+to callers, add authentication and authorization at the infrastructure layer,
+the FastAPI app layer, or inside the route body.
 
-## Key Components
+Session continuation deserves particular care: treat `previous_response_id` as
+an untrusted request value, authorize the caller before restoring or storing a
+checkpoint cursor for that id, and partition durable checkpoint/cursor storage
+by tenant/user as appropriate for your application.
 
-- **`SkillsProvider`** — Discovers skills from `SKILL.md` files in a directory and registers tools for the agent
-- **`subprocess_script_runner`** — A `SkillScriptRunner` callback that runs scripts as local Python subprocesses, enabling the `run_skill_script` tool. Converts argument dicts to CLI flags (e.g. `{"value": 26.2, "factor": 1.60934}` → `--value 26.2 --factor 1.60934`). Shared across samples in [`../subprocess_script_runner.py`](../subprocess_script_runner.py).
-
-## Project Structure
-
-```
-file_based_skill/
-├── file_based_skill.py
-├── README.md
-└── skills/
-    └── unit-converter/
-        ├── SKILL.md
-        ├── references/
-        │   └── CONVERSION_TABLES.md
-        └── scripts/
-            └── convert.py
-```
-
-## Running the Sample
-
-### Prerequisites
-- A [Microsoft Foundry](https://ai.azure.com/) project with a deployed model (e.g. `gpt-4o-mini`)
-
-### Environment Variables
-
-Set the required environment variables in a `.env` file (see `python/.env.example`):
-
-- `FOUNDRY_PROJECT_ENDPOINT`: Your Microsoft Foundry project endpoint
-- `AZURE_OPENAI_MODEL`: The name of your model deployment (defaults to `gpt-4o-mini`)
-
-### Authentication
-
-This sample uses `AzureCliCredential` for authentication. Run `az login` in your terminal before running the sample.
-
-### Run
+## Run
 
 ```bash
-cd python
-uv run samples/02-agents/skills/file_based_skill/file_based_skill.py
+export FOUNDRY_PROJECT_ENDPOINT=https://<your-project>.services.ai.azure.com
+export FOUNDRY_MODEL=gpt-5-nano
+az login
+
+uv sync
+uv run hypercorn app:app --bind 0.0.0.0:8000
 ```
 
-## Learn More
+Single-process for quick iteration:
 
-- [Agent Skills Specification](https://agentskills.io/)
-- [Code-Defined Skills Sample](../code_defined_skill/)
-- [Mixed Skills Sample](../mixed_skills/)
-- [Microsoft Agent Framework Documentation](../../../../../docs/)
+```bash
+uv run python app.py
+```
+
+## Call locally
+
+```bash
+uv sync --group dev
+uv run python call_server.py '{"topic": "electric SUV", "style": "playful", "audience": "young families"}'
+```
+
+The script sends a follow-up using the first response id as
+`previous_response_id`, so the workflow restores the prior checkpoint before
+running the next turn. It deliberately does not send `conversation_id`, because
+this sample rejects `conversation_id` continuation.
+
+> This sample uses local file storage under `storage/` for both workflow
+> checkpoints and checkpoint cursors. The checkpoint bucket names are hashed
+> from the continuation id before they are used as directory names. Replace this
+> with production-grade durable storage for multi-replica or transient hosting.
